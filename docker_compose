@@ -18,8 +18,19 @@ services:
     working_dir: /app/code
     # Dieser Command ersetzt das Dockerfile und die requirements.txt
     command: >
-      /bin/sh -c "pip install --no-cache-dir fastapi uvicorn python-multipart authlib httpx itsdangerous pillow google-genai
-      && uvicorn app:app --host 0.0.0.0 --port 80 --proxy-headers --forwarded-allow-ips '*'"
+      /bin/sh -c "
+      echo '--- 1. Installing curl ---' &&
+      apt-get update && apt-get install -y curl &&
+      echo '--- 2. Deleting old app.py ---' &&
+      rm -f app.py &&
+      echo '--- 3. Downloading app.py (Direct Raw Link) ---' &&
+      curl -sSL -H 'Cache-Control: no-cache' 'https://raw.githubusercontent.com/inteampilz/promptz/main/app.py' -o app.py &&
+      if [ ! -s app.py ]; then echo 'ERROR: Downloaded file is empty!'; exit 1; fi &&
+      echo '--- 4. Installing dependencies ---' &&
+      pip install --no-cache-dir fastapi uvicorn python-multipart authlib httpx itsdangerous pillow google-genai &&
+      echo '--- 5. Starting App ---' &&
+      uvicorn app:app --host 0.0.0.0 --port 80 --proxy-headers --forwarded-allow-ips '*'
+      "
     networks:
       - proxy
 
