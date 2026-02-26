@@ -192,9 +192,6 @@ async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
     if not current:
         conn.close()
         raise HTTPException(status_code=404, detail="Prompt not found.")
-    if current['user_email'] != user['email']:
-        conn.close()
-        raise HTTPException(status_code=403, detail="Not the owner.")
 
     c.execute("SELECT * FROM prompt_history WHERE history_id = ? AND prompt_id = ?", (history_id, prompt_id))
     hist = c.fetchone()
@@ -2107,7 +2104,6 @@ def get_html(request: Request):
                 if (history.length === 0) {
                     container.innerHTML = '<p class="text-gray-400 italic text-center py-8">No previous versions exist for this prompt yet.</p>';
                 } else {
-                    const isOwner = (globalPrompts.find(p => p.id === id) || {}).is_mine || false;
                     history.forEach((h, index) => {
                         const safeTitle = escapeHTML(h.title);
                         const safeAuthor = escapeHTML(h.author);
@@ -2126,9 +2122,7 @@ def get_html(request: Request):
                         } else {
                             historyCopyBtn = `<button onclick="copyToClipboard(this, decodeURIComponent('${encodeForJS(h.prompt)}'), null)" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded font-bold transition-colors">📋 Copy Old</button>`;
                         }
-                        const rollbackBtn = isOwner
-                            ? `<button onclick="rollbackToVersion('${h.prompt_id}', '${h.history_id}')" class="bg-orange-700 hover:bg-orange-600 text-xs px-3 py-1 rounded font-bold transition-colors border border-orange-600">↩ Rollback</button>`
-                            : '';
+                        const rollbackBtn = `<button onclick="rollbackToVersion('${h.prompt_id}', '${h.history_id}')" class="bg-orange-700 hover:bg-orange-600 text-xs px-3 py-1 rounded font-bold transition-colors border border-orange-600">↩ Rollback</button>`;
 
                         container.innerHTML += `
                             <div class="bg-gray-900 rounded p-4 border border-gray-700">
