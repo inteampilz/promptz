@@ -5,6 +5,8 @@ import io
 import json
 import csv
 import zipfile
+import html as html_mod
+from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -64,6 +66,10 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS collection_prompts
                  (collection_id TEXT, prompt_id TEXT,
                   UNIQUE(collection_id, prompt_id))''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS share_links
+                 (token TEXT PRIMARY KEY, prompt_id TEXT, created_by TEXT,
+                  expires_at TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
     conn.commit()
     conn.close()
@@ -210,6 +216,59 @@ async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
     conn.commit()
     conn.close()
     return {"status": "success"}
+
+@app.post("/api/prompts/{prompt_id}/share-link")
+async def create_share_link(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+
+    body = await request.json()
+    try:
+        expires_in_hours = int(body.get("expires_in_hours", 24))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid expires_in_hours.")
+    if not (1 <= expires_in_hours <= 720):
+        raise HTTPException(status_code=400, detail="expires_in_hours must be 1–720.")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id FROM prompts WHERE id = ? AND (user_email = ? OR is_shared = 1)", (prompt_id, user['email']))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Prompt not found.")
+
+    token = str(uuid.uuid4())
+    expires_at = (datetime.utcnow() + timedelta(hours=expires_in_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO share_links (token, prompt_id, created_by, expires_at) VALUES (?, ?, ?, ?)",
+              (token, prompt_id, user['email'], expires_at))
+    conn.commit()
+    conn.close()
+    return {"token": token, "expires_at": expires_at}
+
+@app.get("/api/prompts/{prompt_id}/share-links")
+def list_share_links(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM share_links WHERE prompt_id = ? AND created_by = ? ORDER BY created_at DESC",
+              (prompt_id, user['email']))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+@app.delete("/api/share-links/{token}")
+def revoke_share_link(token: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM share_links WHERE token = ? AND created_by = ?", (token, user['email']))
+    conn.commit()
+    conn.close()
+    return {"status": "revoked"}
 
 @app.post("/api/prompts")
 async def add_prompt(request: Request):
@@ -801,6 +860,73 @@ async def import_data(request: Request, file: UploadFile = File(...)):
     conn.close()
     return {"status": "success", "added": added_prompts, "added_history": added_history}
 
+@app.get("/share/{token}", response_class=HTMLResponse)
+def view_shared_prompt(token: str):
+    def _err(msg, code):
+        return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>NanoBanana Prompts</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center">
+  <div class="text-center p-8">
+    <h1 class="text-3xl font-bold text-yellow-400 mb-4">🍌 NanoBanana Prompts</h1>
+    <p class="text-gray-400">{msg}</p>
+  </div>
+</body></html>""", status_code=code)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM share_links WHERE token = ?", (token,))
+    link = c.fetchone()
+    if not link:
+        conn.close()
+        return _err("Link not found.", 404)
+    if datetime.utcnow() > datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S"):
+        conn.close()
+        return _err("This share link has expired.", 410)
+
+    c.execute("SELECT * FROM prompts WHERE id = ?", (link['prompt_id'],))
+    prompt = c.fetchone()
+    conn.close()
+    if not prompt:
+        return _err("Prompt not found.", 404)
+
+    images = json.loads(prompt['image_path'] or '[]')
+    tags = [t.strip() for t in (prompt['tags'] or '').split(',') if t.strip()]
+    expires_label = datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M UTC")
+
+    safe_title  = html_mod.escape(prompt['title'] or '')
+    safe_author = html_mod.escape(prompt['author'] or '')
+    safe_prompt = html_mod.escape(prompt['prompt'] or '')
+    tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(t)}</span>' for t in tags)
+    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(img)}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
+
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>{safe_title} — NanoBanana Prompts</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-6">
+  <div class="max-w-2xl mx-auto">
+    <div class="text-center mb-8">
+      <h1 class="text-2xl font-bold text-yellow-400">🍌 NanoBanana Prompts</h1>
+      <p class="text-xs text-gray-500 mt-1">Shared link · expires {expires_label}</p>
+    </div>
+    <div class="grid gap-3 mb-6">{imgs_html}</div>
+    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+      <h2 class="text-2xl font-bold mb-1">{safe_title}</h2>
+      <p class="text-sm text-gray-400 mb-3">by {safe_author}</p>
+      <div class="flex flex-wrap gap-2 mb-4">{tags_html}</div>
+      <pre id="promptText" class="bg-gray-900 rounded p-4 text-sm text-gray-200 whitespace-pre-wrap break-words mb-4">{safe_prompt}</pre>
+      <button onclick="navigator.clipboard.writeText(document.getElementById('promptText').textContent).then(()=>{{this.textContent='✓ Copied!';setTimeout(()=>this.textContent='📋 Copy Prompt',1500)}})"
+              class="w-full bg-gray-700 hover:bg-gray-600 py-2 rounded font-bold transition-colors">
+        📋 Copy Prompt
+      </button>
+    </div>
+  </div>
+</body></html>""")
+
 # --- FRONTEND ---
 @app.get("/", response_class=HTMLResponse)
 def get_html(request: Request):
@@ -1161,6 +1287,35 @@ def get_html(request: Request):
                 </div>
                 <p class="text-sm text-gray-400 mb-4">Choose a collection to add <span id="bulkCollectCount" class="text-purple-400 font-bold">0</span> selected prompts to:</p>
                 <div id="bulkCollectionList" class="flex flex-col gap-2"></div>
+            </div>
+        </div>
+
+        <div id="shareLinkModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-md flex flex-col gap-4">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-xl font-bold">🔗 Share Link</h2>
+                    <button onclick="closeModal('shareLinkModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <p class="text-sm text-gray-400">Create a time-limited link anyone can open without an account.</p>
+                <div class="flex gap-2">
+                    <select id="shareLinkExpiry" class="flex-grow bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none">
+                        <option value="1">1 hour</option>
+                        <option value="6">6 hours</option>
+                        <option value="24" selected>24 hours</option>
+                        <option value="72">3 days</option>
+                        <option value="168">7 days</option>
+                        <option value="720">30 days</option>
+                    </select>
+                    <button onclick="createShareLink()" class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold px-4 py-2 rounded text-sm transition-colors">Generate</button>
+                </div>
+                <div id="shareLinkResult" class="hidden flex gap-2">
+                    <input id="shareLinkUrl" type="text" readonly class="flex-grow bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm text-gray-200 font-mono focus:outline-none">
+                    <button id="shareLinkCopyBtn" onclick="copyShareLink()" class="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded text-sm font-bold transition-colors">📋</button>
+                </div>
+                <div>
+                    <h3 class="text-sm font-bold text-gray-300 mb-2">Active links</h3>
+                    <div id="shareLinkList" class="flex flex-col gap-2 max-h-48 overflow-y-auto"></div>
+                </div>
             </div>
         </div>
 
@@ -1897,6 +2052,7 @@ def get_html(request: Request):
                             <button onclick="openEditModal('${p.id}')" class="flex-1 bg-blue-900 hover:bg-blue-800 text-blue-200 py-1 px-2 rounded text-sm transition-colors border border-blue-800">Edit</button>
                             <button onclick="openHistoryModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600">History</button>
                             <button onclick="openCollectionAssignModal('${p.id}')" class="flex-1 bg-teal-900 hover:bg-teal-800 text-teal-200 py-1 px-2 rounded text-sm transition-colors border border-teal-800" title="Add to Collection">📁 Collect</button>
+                            <button onclick="openShareModal('${p.id}')" class="flex-1 bg-yellow-800 hover:bg-yellow-700 text-yellow-200 py-1 px-2 rounded text-sm transition-colors border border-yellow-700" title="Share link">🔗 Share</button>
                             ${deleteBtn}
                         </div>
                     `;
@@ -2063,6 +2219,68 @@ def get_html(request: Request):
             function toggleCardDetails(id) {
                 const details = document.getElementById('card-details-' + id);
                 if (details) details.classList.toggle('hidden');
+            }
+
+            let currentSharePromptId = null;
+
+            async function openShareModal(promptId) {
+                currentSharePromptId = promptId;
+                document.getElementById('shareLinkResult').classList.add('hidden');
+                document.getElementById('shareLinkModal').classList.remove('hidden');
+                await loadShareLinks(promptId);
+            }
+
+            async function loadShareLinks(promptId) {
+                const res = await fetch(`/api/prompts/${promptId}/share-links`);
+                const links = await res.json();
+                const container = document.getElementById('shareLinkList');
+                if (links.length === 0) {
+                    container.innerHTML = '<p class="text-xs text-gray-500 italic">No active links yet.</p>';
+                    return;
+                }
+                const now = new Date();
+                container.innerHTML = links.map(l => {
+                    const exp = new Date(l.expires_at + 'Z');
+                    const expired = exp < now;
+                    const expLabel = expired ? '✗ expired' : 'until ' + exp.toLocaleString();
+                    const url = window.location.origin + '/share/' + l.token;
+                    return `<div class="flex items-center gap-2 bg-gray-900 rounded px-3 py-2 text-xs">
+                        <span class="truncate font-mono ${expired ? 'text-red-400 line-through' : 'text-gray-300'} flex-grow">${url}</span>
+                        <span class="text-gray-500 flex-shrink-0 whitespace-nowrap">${expLabel}</span>
+                        <button onclick="revokeShareLink('${l.token}')" class="text-red-400 hover:text-red-300 flex-shrink-0 font-bold" title="Revoke">✕</button>
+                    </div>`;
+                }).join('');
+            }
+
+            async function createShareLink() {
+                if (!currentSharePromptId) return;
+                const hours = parseInt(document.getElementById('shareLinkExpiry').value);
+                const res = await fetch(`/api/prompts/${currentSharePromptId}/share-link`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({expires_in_hours: hours})
+                });
+                if (!res.ok) { alert('Failed to create link.'); return; }
+                const data = await res.json();
+                const url = window.location.origin + '/share/' + data.token;
+                document.getElementById('shareLinkUrl').value = url;
+                document.getElementById('shareLinkResult').classList.remove('hidden');
+                await loadShareLinks(currentSharePromptId);
+            }
+
+            async function revokeShareLink(token) {
+                await fetch(`/api/share-links/${token}`, { method: 'DELETE' });
+                document.getElementById('shareLinkResult').classList.add('hidden');
+                await loadShareLinks(currentSharePromptId);
+            }
+
+            function copyShareLink() {
+                const url = document.getElementById('shareLinkUrl').value;
+                const btn = document.getElementById('shareLinkCopyBtn');
+                navigator.clipboard.writeText(url).then(() => {
+                    btn.textContent = '✓';
+                    setTimeout(() => btn.textContent = '📋', 1500);
+                });
             }
 
             function forkPrompt(id) {
