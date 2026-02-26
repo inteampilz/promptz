@@ -568,6 +568,29 @@ async def auto_generate_tags(request: Request, prompt: str = Form(...), language
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/title/auto")
+async def auto_generate_title(request: Request, prompt: str = Form(...), language: str = Form("English")):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    if not prompt: return {"title": ""}
+    
+    try:
+        client = genai.Client() 
+        instruction = f"""
+        Analyze this prompt for AI image generation and create a short, catchy, and descriptive title (maximum 5 words).
+        Output EXACTLY the title and nothing else. No quotes, no markdown, no further explanations.
+        The title MUST be written in the following language: {language}.
+        Prompt: {prompt}
+        """
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=instruction
+        )
+        title = response.text.strip().replace('\n', '').replace('"', '')
+        return {"title": title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/tags/merge")
 async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = Form(...)):
     user = request.session.get('user')
@@ -1146,6 +1169,7 @@ def get_html(request: Request):
             <div class="w-full max-w-4xl flex justify-between items-center gap-4 flex-wrap">
                 <div class="font-bold text-white text-lg"><span id="bulkCount" class="text-purple-400 text-2xl">0</span> Prompts Selected</div>
                 <div class="flex gap-2">
+                    <button onclick="toggleBulkSelectAll()" id="bulkSelectAllBtn" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded font-bold transition-colors">☑️ Select All</button>
                     <button onclick="bulkTag()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold transition-colors">🏷️ Add Tag</button>
                     <button onclick="openBulkCollectionModal()" class="bg-teal-700 hover:bg-teal-600 text-white px-4 py-2 rounded font-bold transition-colors">📁 Collect</button>
                     <button onclick="bulkDelete()" class="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded font-bold transition-colors">🗑️ Delete</button>
@@ -1222,7 +1246,14 @@ def get_html(request: Request):
                     <input type="hidden" id="editPromptId" name="editPromptId" value="">
                     <input type="hidden" id="formForkedFrom" name="forked_from" value="">
                     
-                    <input type="text" id="formTitle" name="title" placeholder="Title" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white">
+                    <div class="flex justify-between items-end mb-1">
+                        <label class="text-sm font-medium text-gray-400">Title</label>
+                        <button type="button" onclick="autoGenerateTitle(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                            ✨ Auto-Title
+                        </button>
+                    </div>
+                    <input type="text" id="formTitle" name="title" placeholder="Title" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white transition-colors">
+                    
                     <div class="relative w-full mb-3">
                         <input type="text" id="formAuthor" name="author" placeholder="Author/Creator" required autocomplete="off" oninput="showAuthorSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
                         <div id="authorSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
@@ -1243,7 +1274,7 @@ def get_html(request: Request):
                         </div>
                     </div>
                     <div class="relative w-full mb-3">
-                        <input type="text" id="formTags" name="tags" placeholder="Tags (comma separated)" required autocomplete="off" oninput="showTagSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
+                        <input type="text" id="formTags" name="tags" placeholder="Tags (comma separated)" required autocomplete="off" oninput="showTagSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white transition-colors">
                         <div id="tagSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
                     </div>
                     
@@ -1253,7 +1284,7 @@ def get_html(request: Request):
                             ✨ Extract from Cover Image
                         </button>
                     </div>
-                    <textarea id="formPrompt" name="prompt" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-32"></textarea>
+                    <textarea id="formPrompt" name="prompt" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-32 transition-colors"></textarea>
                     
                     <div id="dropZone" class="w-full p-6 mb-2 rounded bg-gray-700 border-2 border-dashed border-gray-500 text-center cursor-pointer hover:border-yellow-400 hover:bg-gray-600 transition-colors" onclick="document.getElementById('hiddenFileInput').click()">
                         <input type="file" id="hiddenFileInput" multiple accept="image/*" class="hidden" onchange="handleFileSelect(event)">
@@ -1436,10 +1467,12 @@ def get_html(request: Request):
                 
                 const btn = document.getElementById('bulkModeBtn');
                 const bar = document.getElementById('bulkActionBar');
+                const selectAllBtn = document.getElementById('bulkSelectAllBtn');
                 
                 if (isBulkMode) {
                     btn.classList.replace('bg-purple-700', 'bg-purple-500');
                     bar.classList.remove('translate-y-full');
+                    selectAllBtn.innerText = "☑️ Select All";
                 } else {
                     btn.classList.replace('bg-purple-500', 'bg-purple-700');
                     bar.classList.add('translate-y-full');
@@ -1458,10 +1491,44 @@ def get_html(request: Request):
                 if (isChecked) selectedPrompts.add(id);
                 else selectedPrompts.delete(id);
                 updateBulkCount();
+                updateSelectAllButtonState();
             }
 
             function updateBulkCount() {
                 document.getElementById('bulkCount').innerText = selectedPrompts.size;
+            }
+
+            function toggleBulkSelectAll() {
+                // If everything currently visible is selected, deselect all. Otherwise, select all visible.
+                const currentlyVisibleIds = displayPrompts.map(p => p.id);
+                const allSelected = currentlyVisibleIds.every(id => selectedPrompts.has(id));
+                
+                if (allSelected) {
+                    currentlyVisibleIds.forEach(id => selectedPrompts.delete(id));
+                } else {
+                    currentlyVisibleIds.forEach(id => selectedPrompts.add(id));
+                }
+                
+                // Force a re-render to update the checkboxes visually
+                const currentScroll = window.scrollY;
+                document.getElementById('gallery').innerHTML = '';
+                renderIndex = 0;
+                renderNextBatch();
+                setTimeout(() => window.scrollTo(0, currentScroll), 10);
+                
+                updateBulkCount();
+                updateSelectAllButtonState();
+            }
+            
+            function updateSelectAllButtonState() {
+                const btn = document.getElementById('bulkSelectAllBtn');
+                if(!btn) return;
+                const currentlyVisibleIds = displayPrompts.map(p => p.id);
+                if (currentlyVisibleIds.length > 0 && currentlyVisibleIds.every(id => selectedPrompts.has(id))) {
+                    btn.innerText = "☐ Deselect All";
+                } else {
+                    btn.innerText = "☑️ Select All";
+                }
             }
 
             async function bulkDelete() {
@@ -1893,6 +1960,47 @@ def get_html(request: Request):
                 } catch (e) {}
             }
 
+            async function autoGenerateTitle(btn) {
+                const promptField = document.getElementById('formPrompt');
+                const titleField = document.getElementById('formTitle');
+                const langField = document.getElementById('tagLanguage');
+                
+                if (!promptField.value.trim()) { 
+                    alert("Please enter or extract a prompt text first so Gemini knows what to title!"); 
+                    return; 
+                }
+                
+                const originalText = btn.innerText;
+                btn.innerText = '⏳ Generating...'; 
+                btn.disabled = true;
+                
+                const formData = new FormData();
+                formData.append('prompt', promptField.value);
+                formData.append('language', langField.value);
+                
+                try {
+                    const res = await fetch('/api/title/auto', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.title) {
+                            titleField.value = data.title;
+                            
+                            titleField.classList.remove('flash-success');
+                            void titleField.offsetWidth; 
+                            titleField.classList.add('flash-success');
+                        }
+                    } else {
+                        const err = await res.json();
+                        alert("Error generating title: " + err.detail);
+                    }
+                } catch (e) { 
+                    alert("Failed to connect to Auto-Title API."); 
+                }
+                
+                btn.innerText = originalText; 
+                btn.disabled = false;
+            }
+
             async function autoGenerateTags(btn) {
                 const promptField = document.getElementById('formPrompt');
                 const tagsField = document.getElementById('formTags');
@@ -2078,6 +2186,8 @@ def get_html(request: Request):
                 document.getElementById('gallery').innerHTML = '';
                 renderIndex = 0;
                 renderNextBatch();
+                
+                if (isBulkMode) updateSelectAllButtonState();
             }
 
             function parseImages(pathRaw) {
