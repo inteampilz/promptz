@@ -1,0 +1,42 @@
+
+services:
+  prompt-app:
+    image: python:3.11-slim
+    container_name: nanobanana-prompts1
+    restart: unless-stopped
+    environment:
+      # OIDC & Session Konfiguration
+      - SESSION_SECRET=secret
+      - OIDC_CLIENT_ID=secret
+      - OIDC_CLIENT_SECRET=secret
+      - OIDC_DISCOVERY_URL=https://your_domain.com/.well-known/openid-configuration
+      - GEMINI_API_KEY=secret
+      # HIER ANPASSEN: Pfad zu dem Ordner, in dem deine app.py liegt
+      - /opt/nanobananadev:/app/code
+      # Das Volume für die SQLite Datenbank und Bilder
+      - prompt_data:/app/data
+    working_dir: /app/code
+    # Dieser Command ersetzt das Dockerfile und die requirements.txt
+    command: >
+      /bin/sh -c "pip install --no-cache-dir fastapi uvicorn python-multipart authlib httpx itsdangerous pillow google-genai
+      && uvicorn app:app --host 0.0.0.0 --port 80 --proxy-headers --forwarded-allow-ips '*'"
+    networks:
+      - proxy
+
+  backup-service:
+    image: alpine:latest
+    container_name: nanobanana-backup1
+    restart: unless-stopped
+    volumes:
+      - prompt_data:/data
+      # HIER ANPASSEN: Pfad zu deinem Backup-Ordner auf dem Server
+      - /opt/nanobananadev/backups:/backups
+    command: >
+      /bin/sh -c "echo '0 2 * * * tar -czf /backups/backup-$$(date +\\%Y\\%m\\%d_\\%H\\%M).tar.gz -C / data' > /etc/crontabs/root && crond -f -d 8"
+
+volumes:
+  prompt_data:
+
+networks:
+  proxy:
+    external: true
