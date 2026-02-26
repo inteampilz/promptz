@@ -61,15 +61,15 @@ def init_db():
 
     c.execute('''CREATE TABLE IF NOT EXISTS collections
                  (id TEXT PRIMARY KEY, name TEXT, user_email TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS collection_prompts
                  (collection_id TEXT, prompt_id TEXT,
-                  UNIQUE(collection_id, prompt_id))''')
+                 UNIQUE(collection_id, prompt_id))''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS share_links
                  (token TEXT PRIMARY KEY, prompt_id TEXT, created_by TEXT,
-                  expires_at TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                 expires_at TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
     c.execute("PRAGMA table_info(share_links)")
     sl_cols = [col[1] for col in c.fetchall()]
@@ -408,10 +408,6 @@ async def delete_prompt(prompt_id: str, request: Request):
     c.execute("SELECT image_path FROM prompts WHERE id = ?", (prompt_id,))
     cur_img = c.fetchone()
     
-    # Optional cleanup logic: Only delete images if no other prompt or history uses them
-    # For now, it keeps your existing image deletion logic. Be careful if you fork prompts, 
-    # deleting the parent might delete shared images! Let's prevent shared image deletion if forked.
-    # Note: To keep things simple without deep dependency checks, I'm leaving the file delete but usually you shouldn't delete shared files.
     files_to_delete = set()
     if cur_img and cur_img[0]:
         try: files_to_delete.update(json.loads(cur_img[0]))
@@ -487,9 +483,9 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     for pid in ids:
-        c.execute("SELECT tags FROM prompts WHERE id = ?", (pid,))
+        c.execute("SELECT tags, user_email FROM prompts WHERE id = ?", (pid,))
         row = c.fetchone()
-        if row:
+        if row and row[1] == user['email']: 
             tags_str = row[0] if row[0] else ""
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             if clean_tag not in current_tags:
@@ -889,7 +885,14 @@ def view_shared_prompt(token: str):
     if not link:
         conn.close()
         return _err("Link not found.", 404)
-    if datetime.utcnow() > datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S"):
+        
+    # FALLBACK: Sichert ab, falls das Datum durch ältere Backups defekt ist
+    try:
+        exp_date = datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        exp_date = datetime.utcnow() - timedelta(days=1)
+        
+    if datetime.utcnow() > exp_date:
         conn.close()
         return _err("This share link has expired.", 410)
 
@@ -899,9 +902,22 @@ def view_shared_prompt(token: str):
     if not prompt:
         return _err("Prompt not found.", 404)
 
-    images = json.loads(prompt['image_path'] or '[]')
+    # FALLBACK: Verhindert 500 Fehler, wenn ältere Prompts noch einen einfachen Text statt JSON haben
+    raw_image_path = prompt['image_path']
+    if not raw_image_path:
+        images = []
+    else:
+        try:
+            parsed_images = json.loads(raw_image_path)
+            if isinstance(parsed_images, list):
+                images = parsed_images
+            else:
+                images = [str(parsed_images)]
+        except Exception:
+            images = [raw_image_path]
+
     tags = [t.strip() for t in (prompt['tags'] or '').split(',') if t.strip()]
-    expires_label = datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M UTC")
+    expires_label = exp_date.strftime("%Y-%m-%d %H:%M UTC")
 
     safe_title  = html_mod.escape(prompt['title'] or '')
     safe_author = html_mod.escape(prompt['author'] or '')
@@ -2035,7 +2051,6 @@ def get_html(request: Request):
                             termMatch = isNegation ? !p.is_shared : p.is_shared;
                         } else {
                             const textToSearch = (p.title + " " + p.prompt + " " + p.tags + " " + p.author).toLowerCase();
-                            // HIER GEFIXT: Findet das gesuchte Wort ODER falls die exakte ID des Prompts gesucht wird
                             const hasText = textToSearch.includes(actualTerm) || p.id === actualTerm;
                             termMatch = isNegation ? !hasText : hasText;
                         }
@@ -2105,7 +2120,6 @@ def get_html(request: Request):
 
                     const deleteBtn = p.is_mine ? `<button onclick="deletePrompt('${p.id}')" class="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-1 px-2 rounded text-sm transition-colors border border-red-800">Delete</button>` : '';
 
-                    // HIER NEU: Fork Button neben den anderen Aktionen
                     let actionButtons = `
                         <div class="flex flex-wrap gap-2 mt-2">
                             <button onclick="forkPrompt('${p.id}')" class="flex-1 bg-purple-900 hover:bg-purple-800 text-purple-200 py-1 px-2 rounded text-sm transition-colors border border-purple-800" title="Copy as new prompt">🍴 Fork</button>
@@ -2137,7 +2151,6 @@ def get_html(request: Request):
                         `;
                     }
 
-                    // Lightbox zoom button (visible on hover)
                     const firstImg = images.length > 0 ? images[0] : '';
                     carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('/images/${firstImg}')" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
                     
@@ -2171,7 +2184,6 @@ def get_html(request: Request):
                         </div>
                     `;
 
-                    // HIER NEU: Visueller Marker für geforkte Prompts
                     let forkBadge = '';
                     if (p.forked_from) {
                         const parentTitle = p.forked_from_title ? escapeHTML(p.forked_from_title) : 'Deleted Prompt';
@@ -2236,7 +2248,7 @@ def get_html(request: Request):
             function openAddModal() {
                 document.getElementById('modalTitle').innerText = 'Add New Prompt';
                 document.getElementById('editPromptId').value = '';
-                document.getElementById('formForkedFrom').value = ''; // Reset Fork ID
+                document.getElementById('formForkedFrom').value = ''; 
                 document.getElementById('promptForm').reset();
                 document.getElementById('is_shared').checked = true;
                 
@@ -2255,7 +2267,7 @@ def get_html(request: Request):
                 
                 document.getElementById('modalTitle').innerText = 'Edit Prompt (Wiki Mode)';
                 document.getElementById('editPromptId').value = p.id;
-                document.getElementById('formForkedFrom').value = ''; // Reset Fork ID
+                document.getElementById('formForkedFrom').value = ''; 
                 document.getElementById('formTitle').value = p.title;
                 document.getElementById('formAuthor').value = p.author;
                 document.getElementById('formTags').value = p.tags;
@@ -2275,7 +2287,6 @@ def get_html(request: Request):
                 document.getElementById('promptModal').classList.remove('hidden');
             }
 
-            // HIER NEU: Die Funktion, um das Modal im Forking-Modus zu öffnen
             function toggleCardDetails(id) {
                 const details = document.getElementById('card-details-' + id);
                 if (details) details.classList.toggle('hidden');
@@ -2357,20 +2368,19 @@ def get_html(request: Request):
                 if(!p) return;
                 
                 document.getElementById('modalTitle').innerText = 'Fork Prompt';
-                document.getElementById('editPromptId').value = ''; // New Prompt, so NO Edit ID
-                document.getElementById('formForkedFrom').value = p.id; // Store parent ID
+                document.getElementById('editPromptId').value = ''; 
+                document.getElementById('formForkedFrom').value = p.id; 
                 
                 document.getElementById('formTitle').value = "Fork of " + p.title;
                 document.getElementById('formAuthor').value = p.author;
                 document.getElementById('formTags').value = p.tags;
                 document.getElementById('formPrompt').value = p.prompt;
-                document.getElementById('is_shared').checked = false; // Forks default to private
+                document.getElementById('is_shared').checked = false; 
                 document.getElementById('is_shared').disabled = false;
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
                 
-                // Copy existing images to the new fork
                 const imgs = parseImages(p.image_path);
                 mediaItems = imgs.map((img, idx) => ({
                     type: 'existing', val: img, url: '/images/' + img, isCover: idx === 0 
@@ -2385,7 +2395,7 @@ def get_html(request: Request):
                 const res = await fetch(`/api/prompts/${promptId}/rollback/${historyId}`, { method: 'POST' });
                 if (res.ok) {
                     closeModal('historyModal');
-                    await loadPrompts();
+                    await fetchPrompts();
                 } else {
                     const err = await res.json().catch(() => ({}));
                     alert('Rollback failed: ' + (err.detail || res.status));
@@ -2725,8 +2735,8 @@ def get_html(request: Request):
                         const isChecked = currentCollectionIds.includes(col.id);
                         return `
                             <label class="flex items-center gap-3 p-3 bg-gray-700 rounded border border-gray-600 cursor-pointer hover:border-teal-500 transition-colors">
-                                <input type="checkbox" class="w-4 h-4 rounded accent-teal-500 flex-shrink-0"
-                                       ${isChecked ? 'checked' : ''}
+                                <input type="checkbox" class="w-4 h-4 rounded accent-teal-500 flex-shrink-0" 
+                                       ${isChecked ? 'checked' : ''} 
                                        onchange="togglePromptInCollection('${col.id}', '${promptId}', this.checked)">
                                 <span class="font-medium">📁 ${safeName}</span>
                                 <span class="text-xs text-gray-400 ml-auto">${col.prompt_count} prompts</span>
@@ -2756,7 +2766,7 @@ def get_html(request: Request):
                         const col = collections.find(c => c.id === collectionId);
                         if (col) col.prompt_count = Math.max(0, col.prompt_count + (shouldAdd ? 1 : -1));
                         if (activeCollectionId === collectionId && !shouldAdd) triggerRenderReset();
-                        // Refresh badge on the card without full re-render
+                        
                         const cardEl = document.getElementById('card-' + promptId);
                         if (cardEl) {
                             const badgeWrapper = cardEl.querySelector('.collection-badge-wrapper');
