@@ -387,9 +387,9 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     for pid in ids:
-        c.execute("SELECT tags, user_email FROM prompts WHERE id = ?", (pid,))
+        c.execute("SELECT tags FROM prompts WHERE id = ?", (pid,))
         row = c.fetchone()
-        if row and row[1] == user['email']: 
+        if row:
             tags_str = row[0] if row[0] else ""
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             if clean_tag not in current_tags:
@@ -832,7 +832,7 @@ def get_html(request: Request):
         <div class="w-full max-w-[2400px] mx-auto">
             
             <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 md:mb-8 gap-4">
-                <h1 class="text-3xl md:text-4xl font-bold text-yellow-400">🍌 NanoBanana Prompts</h1>
+                <h1 class="text-3xl md:text-4xl font-bold text-yellow-400 cursor-pointer hover:text-yellow-300 transition-colors select-none" onclick="resetToHome()" title="Back to home">🍌 NanoBanana Prompts</h1>
                 
                 <div class="flex items-center gap-3 md:gap-4 flex-wrap">
                     <span id="promptCounter" class="bg-gray-800 text-yellow-400 font-bold px-3 py-1 rounded border border-gray-700 text-sm">
@@ -1706,6 +1706,14 @@ def get_html(request: Request):
 
             function clearSearch() {
                 document.getElementById('searchInput').value = '';
+                triggerRenderReset();
+            }
+
+            function resetToHome() {
+                document.getElementById('searchInput').value = '';
+                if (showOnlyFavorites) toggleFavFilter();
+                if (activeCollectionId) clearCollectionFilter();
+                window.scrollTo({ top: 0, behavior: 'smooth' });
                 triggerRenderReset();
             }
 
