@@ -1883,10 +1883,10 @@ def get_html(request: Request):
                         return `<button onclick="triggerSearch(decodeURIComponent('tag:${encodeForJS(rawTag)}'))" class="bg-gray-700 hover:bg-yellow-500 hover:text-black transition-colors text-xs px-2 py-1 rounded truncate max-w-full cursor-pointer focus:outline-none">${safeTag}</button>`;
                     }).join(' ');
                     
-                    let badge = p.is_mine 
-                        ? (p.is_shared ? '<span class="absolute top-2 right-2 bg-blue-600 text-white text-xs px-2 py-1 rounded shadow z-10">My Shared Prompt</span>' 
-                                       : '<span class="absolute top-2 right-2 bg-gray-900 text-white text-xs px-2 py-1 rounded shadow border border-gray-700 z-10">Private</span>')
-                        : '<span class="absolute top-2 right-2 bg-green-600 text-white text-xs px-2 py-1 rounded shadow truncate max-w-[80%] z-10">Shared by ' + escapeHTML(p.user_email) + '</span>';
+                    let badge = p.is_mine
+                        ? (p.is_shared ? '<span class="bg-blue-600 text-white text-xs px-2 py-1 rounded shadow">My Shared Prompt</span>'
+                                       : '<span class="bg-gray-900 text-white text-xs px-2 py-1 rounded shadow border border-gray-700">Private</span>')
+                        : '<span class="bg-green-600 text-white text-xs px-2 py-1 rounded shadow truncate max-w-full inline-block">Shared by ' + escapeHTML(p.user_email) + '</span>';
 
                     const deleteBtn = p.is_mine ? `<button onclick="deletePrompt('${p.id}')" class="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-1 px-2 rounded text-sm transition-colors border border-red-800">Delete</button>` : '';
 
@@ -1909,7 +1909,7 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach(img => {
-                        carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full object-cover bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                        carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
@@ -1967,30 +1967,30 @@ def get_html(request: Request):
 
                     htmlChunk += `
                         <div class="bg-gray-800 rounded-lg overflow-hidden border ${selectedPrompts.has(p.id) ? 'border-purple-500' : 'border-gray-700'} shadow-lg flex flex-col relative group transition-colors" id="card-${p.id}">
-                            ${badge}
                             ${bulkCheckboxHtml}
 
-                            <div class="relative w-full aspect-square group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); } else { toggleCardDetails('${p.id}'); }">
+                            <div class="relative w-full aspect-square overflow-hidden group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); } else { toggleCardDetails('${p.id}'); }">
                                 ${carouselHtml}
                             </div>
 
                             <div class="p-3 sm:p-4 flex flex-col flex-grow">
                                 ${forkBadge}
-                                <div class="flex justify-between items-start mb-1 gap-2">
-                                    <h3 class="text-lg sm:text-xl font-bold truncate flex-grow">${safeTitle}</h3>
-                                    <div class="flex items-center gap-2 flex-shrink-0">
-                                        <button onclick="toggleFavorite('${p.id}')" id="fav-btn-${p.id}" class="text-xl hover:scale-110 transition-transform focus:outline-none" title="Toggle Favorite">${favIcon}</button>
-                                        <div class="bg-gray-900 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-400 font-bold" title="Times copied">
-                                            📋 <span id="count-${p.id}">${copyCount}</span>
-                                        </div>
-                                    </div>
-                                </div>
+                                <h3 class="text-lg sm:text-xl font-bold truncate mb-2">${safeTitle}</h3>
 
                                 <div id="card-details-${p.id}" class="hidden">
-                                    <p class="text-xs sm:text-sm text-gray-400 mb-2 sm:mb-3 truncate">
+                                    <div class="flex items-center justify-between mb-2 gap-2">
+                                        ${badge}
+                                        <div class="flex items-center gap-2 flex-shrink-0 ml-auto">
+                                            <button onclick="toggleFavorite('${p.id}')" id="fav-btn-${p.id}" class="text-xl hover:scale-110 transition-transform focus:outline-none" title="Toggle Favorite">${favIcon}</button>
+                                            <div class="bg-gray-900 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-400 font-bold" title="Times copied">
+                                                📋 <span id="count-${p.id}">${copyCount}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <p class="text-xs sm:text-sm text-gray-400 mb-2 truncate">
                                         Author: <button onclick="triggerSearch(decodeURIComponent('author:${encodeForJS(p.author)}'))" class="hover:text-yellow-400 underline decoration-gray-600 hover:decoration-yellow-400 transition-colors cursor-pointer focus:outline-none">${safeAuthor}</button>
                                     </p>
-                                    <div class="flex flex-wrap gap-1 mb-3 sm:mb-4 content-start">${tagsHtml}</div>
+                                    <div class="flex flex-wrap gap-1 mb-3 content-start">${tagsHtml}</div>
                                     <div class="collection-badge-wrapper mb-2">${renderCollectionBadgesHtml(p)}</div>
                                     ${actionButtons}
                                 </div>
