@@ -481,17 +481,82 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     if not clean_tag: return {"status": "success"}
     
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     for pid in ids:
-        c.execute("SELECT tags, user_email FROM prompts WHERE id = ?", (pid,))
-        row = c.fetchone()
-        if row and row[1] == user['email']: 
-            tags_str = row[0] if row[0] else ""
+        c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
+        current = c.fetchone()
+        # Erlaube Tagging, wenn man Besitzer ist ODER der Prompt geteilt ist (Wiki Modus)
+        if current and (current['user_email'] == user['email'] or current['is_shared'] == 1):
+            tags_str = current['tags'] if current['tags'] else ""
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+            
             if clean_tag not in current_tags:
                 current_tags.append(clean_tag)
-                c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (", ".join(current_tags), pid))
+                new_tags_str = ", ".join(current_tags)
+                
+                # History-Backup für den Wiki-Modus abspeichern
+                c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user['email']))
+                
+                c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (new_tags_str, pid))
     conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.post("/api/prompts/bulk/auto-tag")
+async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language: str = Form("English")):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
+    if not ids: return {"status": "success"}
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    client = genai.Client()
+    
+    for pid in ids:
+        c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
+        current = c.fetchone()
+        
+        # Nur anwenden wenn man Rechte hat (Besitzer oder Wiki-Modus) und Prompt-Text existiert
+        if current and (current['user_email'] == user['email'] or current['is_shared'] == 1) and current['prompt']:
+            prompt_text = current['prompt']
+            instruction = f"""
+            Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
+            Output EXACTLY a comma-separated list of tags in lowercase. No markdown, no further explanations.
+            The tags MUST be written in the following language: {language}.
+            Prompt: {prompt_text}
+            """
+            try:
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=instruction
+                )
+                new_tags_raw = response.text.strip().replace('\n', '').replace('"', '')
+                new_tags = [t.strip() for t in new_tags_raw.split(',') if t.strip()]
+                
+                tags_str = current['tags'] if current['tags'] else ""
+                current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+                
+                added = False
+                for nt in new_tags:
+                    if nt not in current_tags:
+                        current_tags.append(nt)
+                        added = True
+                        
+                if added:
+                    new_tags_str = ", ".join(current_tags)
+                    c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                              (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user['email']))
+                    c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (new_tags_str, pid))
+                    conn.commit()
+            except Exception as e:
+                print(f"Error auto-tagging prompt {pid}: {e}")
+                # Wir überspringen Fehler (z.B. API Limits) bei einzelnen Prompts und machen mit den restlichen weiter
+                
     conn.close()
     return {"status": "success"}
 
@@ -1166,14 +1231,15 @@ def get_html(request: Request):
         </div>
         
         <div id="bulkActionBar" class="fixed bottom-0 left-0 right-0 bg-gray-800 border-t-4 border-purple-600 p-4 transform translate-y-full transition-transform z-50 flex justify-center shadow-[0_-10px_25px_-5px_rgba(0,0,0,0.5)]">
-            <div class="w-full max-w-4xl flex justify-between items-center gap-4 flex-wrap">
+            <div class="w-full max-w-5xl flex justify-between items-center gap-4 flex-wrap">
                 <div class="font-bold text-white text-lg"><span id="bulkCount" class="text-purple-400 text-2xl">0</span> Prompts Selected</div>
-                <div class="flex gap-2">
-                    <button onclick="toggleBulkSelectAll()" id="bulkSelectAllBtn" class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded font-bold transition-colors">☑️ Select All</button>
-                    <button onclick="bulkTag()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold transition-colors">🏷️ Add Tag</button>
-                    <button onclick="openBulkCollectionModal()" class="bg-teal-700 hover:bg-teal-600 text-white px-4 py-2 rounded font-bold transition-colors">📁 Collect</button>
-                    <button onclick="bulkDelete()" class="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded font-bold transition-colors">🗑️ Delete</button>
-                    <button onclick="toggleBulkMode()" class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded font-bold transition-colors ml-4">Cancel</button>
+                <div class="flex gap-2 flex-wrap">
+                    <button onclick="toggleBulkSelectAll()" id="bulkSelectAllBtn" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-2 rounded font-bold transition-colors">☑️ Select All</button>
+                    <button onclick="bulkTag()" class="bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded font-bold transition-colors">🏷️ Add Tag</button>
+                    <button onclick="bulkAutoTag(this)" class="bg-yellow-600 hover:bg-yellow-500 text-white px-3 py-2 rounded font-bold transition-colors">✨ Auto-Tag</button>
+                    <button onclick="openBulkCollectionModal()" class="bg-teal-700 hover:bg-teal-600 text-white px-3 py-2 rounded font-bold transition-colors">📁 Collect</button>
+                    <button onclick="bulkDelete()" class="bg-red-600 hover:bg-red-500 text-white px-3 py-2 rounded font-bold transition-colors">🗑️ Delete</button>
+                    <button onclick="toggleBulkMode()" class="bg-gray-600 hover:bg-gray-500 text-white px-3 py-2 rounded font-bold transition-colors ml-2">Cancel</button>
                 </div>
             </div>
         </div>
@@ -1499,9 +1565,8 @@ def get_html(request: Request):
             }
 
             function toggleBulkSelectAll() {
-                // If everything currently visible is selected, deselect all. Otherwise, select all visible.
                 const currentlyVisibleIds = displayPrompts.map(p => p.id);
-                const allSelected = currentlyVisibleIds.every(id => selectedPrompts.has(id));
+                const allSelected = currentlyVisibleIds.length > 0 && currentlyVisibleIds.every(id => selectedPrompts.has(id));
                 
                 if (allSelected) {
                     currentlyVisibleIds.forEach(id => selectedPrompts.delete(id));
@@ -1509,7 +1574,6 @@ def get_html(request: Request):
                     currentlyVisibleIds.forEach(id => selectedPrompts.add(id));
                 }
                 
-                // Force a re-render to update the checkboxes visually
                 const currentScroll = window.scrollY;
                 document.getElementById('gallery').innerHTML = '';
                 renderIndex = 0;
@@ -1560,6 +1624,32 @@ def get_html(request: Request):
                     toggleBulkMode();
                     fetchPrompts();
                 } catch(e) { alert("Bulk tagging failed."); }
+            }
+
+            async function bulkAutoTag(btn) {
+                if (selectedPrompts.size === 0) return alert("Please select at least one prompt.");
+                if (!confirm(`Are you sure you want Gemini to auto-tag ${selectedPrompts.size} prompts? This might take a moment.`)) return;
+                
+                const originalText = btn.innerText;
+                btn.innerText = `⏳ Tagging ${selectedPrompts.size}...`;
+                btn.disabled = true;
+                
+                const savedLang = localStorage.getItem('nanobananaTagLanguage') || 'English';
+                const formData = new FormData();
+                formData.append('prompt_ids', Array.from(selectedPrompts).join(','));
+                formData.append('language', savedLang);
+                
+                try {
+                    const res = await fetch('/api/prompts/bulk/auto-tag', { method: 'POST', body: formData });
+                    if (!res.ok) throw new Error();
+                    toggleBulkMode();
+                    fetchPrompts();
+                } catch(e) {
+                    alert("Bulk auto-tagging encountered an error. Some tags might not have been added.");
+                }
+                
+                btn.innerText = originalText;
+                btn.disabled = false;
             }
 
             // --- TEMPLATE SYSTEM (LÜCKENTEXT) ---
