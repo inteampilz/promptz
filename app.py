@@ -1,0 +1,2078 @@
+import os
+import sqlite3
+import uuid
+import io
+import json
+import csv
+import zipfile
+from typing import Optional, List
+from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from authlib.integrations.starlette_client import OAuth
+from PIL import Image
+from google import genai
+from google.genai import types
+
+app = FastAPI()
+
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "super-secret-fallback"))
+
+oauth = OAuth()
+oauth.register(
+    name='oidc',
+    server_metadata_url=os.getenv('OIDC_DISCOVERY_URL'),
+    client_id=os.getenv('OIDC_CLIENT_ID'),
+    client_secret=os.getenv('OIDC_CLIENT_SECRET'),
+    client_kwargs={'scope': 'openid email profile'}
+)
+
+DATA_DIR = "/app/data"
+IMG_DIR = f"{DATA_DIR}/images"
+DB_PATH = f"{DATA_DIR}/prompts.db"
+os.makedirs(IMG_DIR, exist_ok=True)
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS prompts
+                 (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, author TEXT, tags TEXT, 
+                  image_path TEXT, user_email TEXT, is_shared INTEGER)''')
+    
+    # DB Schema Migrations
+    c.execute("PRAGMA table_info(prompts)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'copy_count' not in columns:
+        c.execute("ALTER TABLE prompts ADD COLUMN copy_count INTEGER DEFAULT 0")
+    if 'forked_from' not in columns:
+        c.execute("ALTER TABLE prompts ADD COLUMN forked_from TEXT")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS prompt_history
+                 (history_id TEXT PRIMARY KEY, prompt_id TEXT, title TEXT, prompt TEXT, 
+                  author TEXT, tags TEXT, image_path TEXT, edited_by TEXT, 
+                  edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                  
+    c.execute('''CREATE TABLE IF NOT EXISTS favorites
+                 (user_email TEXT, prompt_id TEXT, UNIQUE(user_email, prompt_id))''')
+                 
+    conn.commit()
+    conn.close()
+
+init_db()
+
+app.mount("/images", StaticFiles(directory=IMG_DIR, html=True), name="images")
+
+async def optimize_and_save_image(upload_file: UploadFile) -> str:
+    image_data = await upload_file.read()
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        img.verify()
+        img = Image.open(io.BytesIO(image_data))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file format.")
+    
+    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+    img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+    
+    filename = f"{uuid.uuid4()}.webp"
+    file_path = os.path.join(IMG_DIR, filename)
+    img.save(file_path, "webp", quality=80, optimize=True)
+    return filename
+
+def extract_metadata_from_image(image_bytes: bytes) -> str:
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load() 
+        info = img.info
+        if 'parameters' in info: return str(info['parameters'])
+        if 'prompt' in info:
+            if isinstance(info['prompt'], str): return info['prompt']
+            else: return json.dumps(info['prompt'], indent=2)
+        if 'Description' in info: return str(info['Description'])
+            
+        exif = img.getexif()
+        if exif:
+            for tag in [270, 37510]:
+                if tag in exif:
+                    val = exif[tag]
+                    if isinstance(val, bytes):
+                        if val.startswith(b'ASCII\x00\x00\x00') or val.startswith(b'UNICODE\x00'):
+                            val = val[8:]
+                        val = val.decode('utf-8', errors='ignore')
+                    val = str(val).strip()
+                    if val and val != "None": return val
+    except Exception: pass
+    return ""
+
+# --- AUTH ROUTES ---
+@app.get('/login')
+async def login(request: Request):
+    redirect_uri = request.url_for('auth_callback')
+    return await oauth.oidc.authorize_redirect(request, str(redirect_uri))
+
+@app.get('/auth')
+async def auth_callback(request: Request):
+    token = await oauth.oidc.authorize_access_token(request)
+    user = token.get('userinfo')
+    if user: request.session['user'] = dict(user)
+    return RedirectResponse('/')
+
+@app.get('/logout')
+async def logout(request: Request):
+    request.session.pop('user', None)
+    return RedirectResponse('/')
+
+# --- API ROUTES ---
+@app.get("/api/prompts")
+def get_prompts(request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    # Left join to grab the title of the parent prompt if it was forked
+    c.execute("""
+        SELECT p.*, CASE WHEN f.prompt_id IS NOT NULL THEN 1 ELSE 0 END as is_favorite,
+               parent.title as forked_from_title
+        FROM prompts p 
+        LEFT JOIN favorites f ON p.id = f.prompt_id AND f.user_email = ?
+        LEFT JOIN prompts parent ON p.forked_from = parent.id
+        WHERE p.is_shared = 1 OR p.user_email = ? 
+        ORDER BY p.rowid DESC
+    """, (user['email'], user['email']))
+    rows = [dict(row) for row in c.fetchall()]
+    conn.close()
+    
+    for row in rows:
+        row['is_mine'] = (row['user_email'] == user['email'])
+        row['is_favorite'] = bool(row['is_favorite'])
+    return rows
+
+@app.get("/api/prompts/{prompt_id}/history")
+def get_prompt_history(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM prompt_history WHERE prompt_id = ? ORDER BY edited_at DESC", (prompt_id,))
+    rows = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return rows
+
+@app.post("/api/prompts")
+async def add_prompt(request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    form = await request.form()
+    title = form.get("title")
+    prompt = form.get("prompt")
+    author = form.get("author")
+    tags = form.get("tags")
+    is_shared = form.get("is_shared", "false")
+    forked_from = form.get("forked_from") or None
+    new_images = form.getlist("new_images")
+    media_order_raw = form.get("media_order", "[]")
+    
+    try: media_order = json.loads(media_order_raw)
+    except: media_order = []
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM prompts WHERE prompt = ?", (prompt.strip(),))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="This exact prompt already exists!")
+
+    saved_filenames = []
+    for img in new_images:
+        if hasattr(img, "filename") and hasattr(img, "read"):
+            if getattr(img, "filename", ""):
+                saved_filenames.append(await optimize_and_save_image(img))
+            
+    final_images = []
+    for item in media_order:
+        if item.startswith("existing:"):
+            # When forking, we copy existing images into the new prompt
+            final_images.append(item.split(":", 1)[1])
+        elif item.startswith("new:"):
+            idx = int(item.split(":")[1])
+            if idx < len(saved_filenames): final_images.append(saved_filenames[idx])
+
+    if not final_images:
+        conn.close()
+        raise HTTPException(status_code=400, detail="At least one image is required.")
+
+    image_path_json = json.dumps(final_images)
+    shared_int = 1 if is_shared == "true" else 0
+    c.execute("""INSERT INTO prompts (id, title, prompt, author, tags, image_path, user_email, is_shared, forked_from) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (str(uuid.uuid4()), title, prompt.strip(), author, tags, image_path_json, user['email'], shared_int, forked_from))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.put("/api/prompts/{prompt_id}")
+async def edit_prompt(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+
+    form = await request.form()
+    title = form.get("title")
+    prompt = form.get("prompt")
+    author = form.get("author")
+    tags = form.get("tags")
+    is_shared = form.get("is_shared", "false")
+    new_images = form.getlist("new_images")
+    media_order_raw = form.get("media_order", "[]")
+    
+    try: media_order = json.loads(media_order_raw)
+    except: media_order = []
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,))
+    current_row = c.fetchone()
+    if not current_row:
+        conn.close()
+        raise HTTPException(status_code=404)
+
+    c.execute("SELECT id FROM prompts WHERE prompt = ? AND id != ?", (prompt.strip(), prompt_id))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Prompt text exists already.")
+
+    c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (str(uuid.uuid4()), prompt_id, current_row['title'], current_row['prompt'], current_row['author'], current_row['tags'], current_row['image_path'], user['email']))
+
+    saved_filenames = []
+    for img in new_images:
+        if hasattr(img, "filename") and hasattr(img, "read"):
+            if getattr(img, "filename", ""):
+                saved_filenames.append(await optimize_and_save_image(img))
+            
+    final_images = []
+    for item in media_order:
+        if item.startswith("existing:"): final_images.append(item.split(":", 1)[1])
+        elif item.startswith("new:"):
+            idx = int(item.split(":")[1])
+            if idx < len(saved_filenames): final_images.append(saved_filenames[idx])
+
+    if not final_images:
+        conn.close()
+        raise HTTPException(status_code=400, detail="At least one image is required.")
+
+    image_path_json = json.dumps(final_images)
+    is_owner = (current_row['user_email'] == user['email'])
+    shared_int = 1 if is_shared == "true" else 0 if is_owner else current_row['is_shared']
+
+    c.execute("""UPDATE prompts SET title = ?, prompt = ?, author = ?, tags = ?, image_path = ?, is_shared = ? WHERE id = ?""", 
+              (title, prompt.strip(), author, tags, image_path_json, shared_int, prompt_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.delete("/api/prompts/{prompt_id}")
+async def delete_prompt(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM prompts WHERE id = ?", (prompt_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403)
+        
+    c.execute("SELECT image_path FROM prompts WHERE id = ?", (prompt_id,))
+    cur_img = c.fetchone()
+    
+    # Optional cleanup logic: Only delete images if no other prompt or history uses them
+    # For now, it keeps your existing image deletion logic. Be careful if you fork prompts, 
+    # deleting the parent might delete shared images! Let's prevent shared image deletion if forked.
+    # Note: To keep things simple without deep dependency checks, I'm leaving the file delete but usually you shouldn't delete shared files.
+    files_to_delete = set()
+    if cur_img and cur_img[0]:
+        try: files_to_delete.update(json.loads(cur_img[0]))
+        except: files_to_delete.add(cur_img[0])
+    c.execute("SELECT image_path FROM prompt_history WHERE prompt_id = ?", (prompt_id,))
+    for h_row in c.fetchall():
+        if h_row[0]:
+            try: files_to_delete.update(json.loads(h_row[0]))
+            except: files_to_delete.add(h_row[0])
+            
+    # Remove file from disk only if no other prompt uses it (safe cleanup)
+    for f in files_to_delete:
+        c.execute("SELECT count(*) FROM prompts WHERE image_path LIKE ?", (f'%{f}%',))
+        usage_count = c.fetchone()[0]
+        if usage_count <= 1:
+            fp = os.path.join(IMG_DIR, f)
+            if os.path.exists(fp): os.remove(fp)
+
+    c.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
+    c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (prompt_id,))
+    c.execute("DELETE FROM favorites WHERE prompt_id = ?", (prompt_id,)) 
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+# --- BULK API ROUTES ---
+@app.post("/api/prompts/bulk/delete")
+async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    for pid in ids:
+        c.execute("SELECT user_email, image_path FROM prompts WHERE id = ?", (pid,))
+        row = c.fetchone()
+        if row and row[0] == user['email']: 
+            files_to_delete = set()
+            if row[1]:
+                try: files_to_delete.update(json.loads(row[1]))
+                except: files_to_delete.add(row[1])
+            c.execute("SELECT image_path FROM prompt_history WHERE prompt_id = ?", (pid,))
+            for h_row in c.fetchall():
+                if h_row[0]:
+                    try: files_to_delete.update(json.loads(h_row[0]))
+                    except: files_to_delete.add(h_row[0])
+                    
+            for f in files_to_delete:
+                c.execute("SELECT count(*) FROM prompts WHERE image_path LIKE ?", (f'%{f}%',))
+                usage_count = c.fetchone()[0]
+                if usage_count <= 1:
+                    fp = os.path.join(IMG_DIR, f)
+                    if os.path.exists(fp): os.remove(fp)
+
+            c.execute("DELETE FROM prompts WHERE id = ?", (pid,))
+            c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (pid,))
+            c.execute("DELETE FROM favorites WHERE prompt_id = ?", (pid,)) 
+            
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.post("/api/prompts/bulk/tag")
+async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
+    clean_tag = new_tag.strip()
+    if not clean_tag: return {"status": "success"}
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for pid in ids:
+        c.execute("SELECT tags, user_email FROM prompts WHERE id = ?", (pid,))
+        row = c.fetchone()
+        if row and row[1] == user['email']: 
+            tags_str = row[0] if row[0] else ""
+            current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+            if clean_tag not in current_tags:
+                current_tags.append(clean_tag)
+                c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (", ".join(current_tags), pid))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.post("/api/prompts/{prompt_id}/copy")
+async def increment_copy(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE prompts SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?", (prompt_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.post("/api/prompts/{prompt_id}/favorite")
+async def toggle_favorite(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM favorites WHERE user_email = ? AND prompt_id = ?", (user['email'], prompt_id))
+    is_fav = c.fetchone()
+    if is_fav:
+        c.execute("DELETE FROM favorites WHERE user_email = ? AND prompt_id = ?", (user['email'], prompt_id))
+        status = False
+    else:
+        c.execute("INSERT INTO favorites (user_email, prompt_id) VALUES (?, ?)", (user['email'], prompt_id))
+        status = True
+    conn.commit()
+    conn.close()
+    return {"is_favorite": status}
+
+@app.post("/api/extract-metadata")
+async def extract_metadata(request: Request, image: Optional[UploadFile] = File(None), existing_image: Optional[str] = Form(None)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    image_data = None
+    if image and hasattr(image, "filename") and image.filename:
+        image_data = await image.read()
+    elif existing_image:
+        safe_name = os.path.basename(existing_image)
+        file_path = os.path.join(IMG_DIR, safe_name)
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                image_data = f.read()
+                
+    if not image_data:
+        raise HTTPException(status_code=400, detail="No image provided")
+        
+    return {"extracted_prompt": extract_metadata_from_image(image_data)}
+
+@app.post("/api/tags/auto")
+async def auto_generate_tags(request: Request, prompt: str = Form(...), language: str = Form("English")):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    if not prompt: return {"tags": ""}
+    
+    try:
+        client = genai.Client() 
+        instruction = f"""
+        Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
+        Output EXACTLY a comma-separated list of tags in lowercase. No markdown, no further explanations.
+        The tags MUST be written in the following language: {language}.
+        Prompt: {prompt}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=instruction
+        )
+        tags = response.text.strip().replace('\n', '').replace('"', '')
+        return {"tags": tags}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/tags/merge")
+async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    old_tag = old_tag.strip()
+    new_tag = new_tag.strip()
+    if not old_tag or not new_tag: raise HTTPException(status_code=400)
+        
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, tags FROM prompts")
+    rows = c.fetchall()
+    
+    for row in rows:
+        if not row['tags']: continue
+        current_tags = [t.strip() for t in row['tags'].split(',')]
+        if old_tag in current_tags:
+            updated_tags = []
+            for t in current_tags:
+                if t == old_tag:
+                    if new_tag not in updated_tags: updated_tags.append(new_tag)
+                else:
+                    if t not in updated_tags: updated_tags.append(t)
+            c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (", ".join(updated_tags), row['id']))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+# --- EXPORT & IMPORT API ---
+@app.get("/api/export/{format}")
+def export_data(format: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM prompts WHERE is_shared = 1 OR user_email = ?", (user['email'],))
+    prompts_rows = [dict(r) for r in c.fetchall()]
+    
+    prompt_ids = set([r['id'] for r in prompts_rows])
+    c.execute("SELECT * FROM prompt_history")
+    all_history = [dict(r) for r in c.fetchall()]
+    history_rows = [h for h in all_history if h['prompt_id'] in prompt_ids]
+    
+    conn.close()
+    
+    export_payload = {
+        "prompts": prompts_rows,
+        "history": history_rows
+    }
+
+    if format == "json":
+        return Response(content=json.dumps(export_payload, indent=2), media_type="application/json", headers={"Content-Disposition": "attachment; filename=nanobanana_backup.json"})
+    elif format == "csv":
+        output = io.StringIO()
+        if prompts_rows:
+            writer = csv.DictWriter(output, fieldnames=prompts_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(prompts_rows)
+        return Response(content=output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=nanobanana_backup.csv"})
+    elif format == "zip":
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("backup.json", json.dumps(export_payload, indent=2))
+            
+            images_added = set()
+            
+            for row in prompts_rows + history_rows:
+                try:
+                    imgs = json.loads(row['image_path'])
+                    if not isinstance(imgs, list): imgs = [row['image_path']]
+                except:
+                    imgs = [row['image_path']]
+                
+                for img in imgs:
+                    if img and img not in images_added:
+                        img_full_path = os.path.join(IMG_DIR, img)
+                        if os.path.exists(img_full_path):
+                            zip_file.write(img_full_path, arcname=f"images/{img}")
+                            images_added.add(img)
+                            
+        return Response(content=zip_buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=nanobanana_full_backup.zip"})
+        
+    raise HTTPException(status_code=400)
+
+@app.post("/api/import")
+async def import_data(request: Request, file: UploadFile = File(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    filename = file.filename.lower()
+    data_payload = {}
+    
+    if filename.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(file.file) as z:
+                json_filename = "backup.json" if "backup.json" in z.namelist() else "prompts.json"
+                if json_filename not in z.namelist():
+                    raise HTTPException(status_code=400, detail="Invalid ZIP: Missing backup.json")
+                
+                json_data = json.loads(z.read(json_filename))
+                if isinstance(json_data, dict): data_payload = json_data
+                else: data_payload = {"prompts": json_data, "history": []}
+                
+                for file_info in z.infolist():
+                    if file_info.filename.startswith("images/") and not file_info.is_dir():
+                        safe_filename = os.path.basename(file_info.filename)
+                        if safe_filename:
+                            target_path = os.path.join(IMG_DIR, safe_filename)
+                            if not os.path.exists(target_path):
+                                with open(target_path, "wb") as f_out:
+                                    f_out.write(z.read(file_info.filename))
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid ZIP file.")
+    else:
+        content = await file.read()
+        if filename.endswith(".json"):
+            try:
+                json_data = json.loads(content.decode("utf-8"))
+                if isinstance(json_data, dict): data_payload = json_data
+                else: data_payload = {"prompts": json_data, "history": []}
+            except: raise HTTPException(status_code=400, detail="Invalid JSON file.")
+        elif filename.endswith(".csv"):
+            try:
+                reader = csv.DictReader(content.decode("utf-8").splitlines())
+                data_payload = {"prompts": list(reader), "history": []}
+            except: raise HTTPException(status_code=400, detail="Invalid CSV file.")
+        else:
+            raise HTTPException(status_code=400, detail="Only ZIP, JSON and CSV files are supported.")
+        
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    added_prompts = 0
+    added_history = 0
+    
+    prompts_to_insert = data_payload.get("prompts", [])
+    history_to_insert = data_payload.get("history", [])
+    id_map = {} 
+    
+    for row in prompts_to_insert:
+        prompt_text = row.get("prompt", "").strip()
+        if not prompt_text: continue
+        
+        old_id = row.get("id")
+        
+        c.execute("SELECT id FROM prompts WHERE prompt = ?", (prompt_text,))
+        existing = c.fetchone()
+        if existing: 
+            if old_id: id_map[old_id] = existing[0] 
+            continue 
+        
+        new_id = str(uuid.uuid4())
+        if old_id: id_map[old_id] = new_id
+        
+        title = row.get("title", "Imported Prompt")
+        author = row.get("author", user['email'])
+        tags = row.get("tags", "")
+        image_path = row.get("image_path", "[]")
+        user_email = row.get("user_email", user['email'])
+        is_shared = int(row.get("is_shared", 0))
+        copy_count = int(row.get("copy_count", 0))
+        forked_from = row.get("forked_from", None)
+        
+        # Restore internal parent linking if the parent was also imported
+        if forked_from and forked_from in id_map:
+            forked_from = id_map[forked_from]
+            
+        c.execute("""INSERT INTO prompts 
+                     (id, title, prompt, author, tags, image_path, user_email, is_shared, copy_count, forked_from) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (new_id, title, prompt_text, author, tags, image_path, user_email, is_shared, copy_count, forked_from))
+        added_prompts += 1
+        
+    for h_row in history_to_insert:
+        old_prompt_id = h_row.get("prompt_id")
+        new_prompt_id = id_map.get(old_prompt_id)
+        if not new_prompt_id: continue 
+        
+        hid = h_row.get("history_id", str(uuid.uuid4()))
+        c.execute("SELECT history_id FROM prompt_history WHERE history_id = ?", (hid,))
+        if c.fetchone(): continue 
+        
+        c.execute("""INSERT INTO prompt_history 
+                     (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by, edited_at) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (hid, new_prompt_id, h_row.get("title"), h_row.get("prompt"), h_row.get("author"), 
+                   h_row.get("tags"), h_row.get("image_path"), h_row.get("edited_by"), h_row.get("edited_at")))
+        added_history += 1
+        
+    conn.commit()
+    conn.close()
+    return {"status": "success", "added": added_prompts, "added_history": added_history}
+
+# --- FRONTEND ---
+@app.get("/", response_class=HTMLResponse)
+def get_html(request: Request):
+    user = request.session.get('user')
+    if not user:
+        return """<!DOCTYPE html><html><head><script src="https://cdn.tailwindcss.com"></script></head>
+        <body class="bg-gray-900 text-white h-screen flex items-center justify-center"><div class="text-center">
+        <h1 class="text-4xl font-bold mb-6 text-yellow-400">🍌 NanoBanana Prompts</h1>
+        <a href="/login" class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-3 px-8 rounded">Login via OIDC</a>
+        </div></body></html>"""
+
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>NanoBanana Prompts</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            #dropZone { transition: all 0.2s ease-in-out; }
+            .autocomplete-list::-webkit-scrollbar { width: 6px; }
+            .autocomplete-list::-webkit-scrollbar-thumb { background: #4B5563; border-radius: 4px; }
+            .autocomplete-list::-webkit-scrollbar-track { background: #1F2937; }
+            .flash-success { animation: flashGreen 1.5s ease-out; }
+            @keyframes flashGreen {
+                0% { border-color: #22c55e; background-color: rgba(34, 197, 94, 0.2); }
+                100% { border-color: #4b5563; background-color: #374151; }
+            }
+            .hide-scrollbar::-webkit-scrollbar { display: none; }
+            .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+            
+            /* Styles für Custom Checkboxes im Bulk Mode */
+            .bulk-checkbox-container input[type="checkbox"] {
+                appearance: none;
+                background-color: #374151;
+                margin: 0;
+                font: inherit;
+                display: grid;
+                place-content: center;
+                transition: 0.2s ease-in-out;
+            }
+            .bulk-checkbox-container input[type="checkbox"]::before {
+                content: "";
+                width: 0.65em;
+                height: 0.65em;
+                transform: scale(0);
+                transition: 120ms transform ease-in-out;
+                box-shadow: inset 1em 1em white;
+                background-color: transform;
+                transform-origin: bottom left;
+                clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+            }
+            .bulk-checkbox-container input[type="checkbox"]:checked {
+                background-color: #a855f7; /* Purple-500 */
+                border-color: #a855f7;
+            }
+            .bulk-checkbox-container input[type="checkbox"]:checked::before { transform: scale(1); }
+        </style>
+    </head>
+    <body class="bg-gray-900 text-white p-4 md:p-6 lg:p-8 font-sans pb-24">
+        <div class="w-full max-w-[2400px] mx-auto">
+            
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 md:mb-8 gap-4">
+                <h1 class="text-3xl md:text-4xl font-bold text-yellow-400">🍌 NanoBanana Prompts</h1>
+                
+                <div class="flex items-center gap-3 md:gap-4 flex-wrap">
+                    <span id="promptCounter" class="bg-gray-800 text-yellow-400 font-bold px-3 py-1 rounded border border-gray-700 text-sm">
+                        0 Prompts
+                    </span>
+                    <span class="text-gray-400 text-sm hidden md:inline">__USER_EMAIL__</span>
+                    <a href="/logout" class="text-red-400 hover:text-red-300 text-sm border border-red-400 hover:border-red-300 rounded px-3 py-1">Logout</a>
+                </div>
+            </div>
+            
+            <div class="flex flex-col lg:flex-row gap-4 mb-8">
+                <div class="flex-grow relative">
+                    <input type="text" id="searchInput" placeholder="Search text, tag:cyberpunk, -tag:3d, author:mike, is:mine..." 
+                           class="w-full p-3 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-yellow-400 pr-10"
+                           onkeyup="triggerRenderReset()">
+                    <button onclick="clearSearch()" class="absolute right-3 top-3 text-gray-400 hover:text-white font-bold" title="Clear search">✕</button>
+                </div>
+                
+                <div class="flex gap-2 sm:gap-4 flex-wrap items-center relative z-20">
+                    <select id="sortSelect" onchange="applySort()" class="bg-gray-800 border border-gray-700 text-white text-sm md:text-base rounded px-2 py-2 focus:outline-none focus:border-yellow-400 cursor-pointer">
+                        <option value="newest">Newest First</option>
+                        <option value="most_copied">Most Copied</option>
+                        <option value="oldest">Oldest First</option>
+                        <option value="least_copied">Least Copied</option>
+                    </select>
+
+                    <select id="layoutSelect" onchange="setLayout(parseInt(this.value))" class="bg-gray-800 border border-gray-700 text-white text-sm md:text-base rounded px-2 py-2 focus:outline-none focus:border-yellow-400 cursor-pointer">
+                        <option value="1">1 Column</option>
+                        <option value="2">2 Columns</option>
+                        <option value="3">3 Columns</option>
+                        <option value="4">4 Columns</option>
+                        <option value="5">5 Columns</option>
+                        <option value="6">6 Columns</option>
+                        <option value="7">7 Columns</option>
+                        <option value="8">8 Columns</option>
+                    </select>
+
+                    <button id="filterFavBtn" onclick="toggleFavFilter()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">
+                        🤍 Favorites
+                    </button>
+
+                    <div class="flex gap-2">
+                        <button onclick="openTagsModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">🏷️ Tags</button>
+                        <button onclick="openAuthorsModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">👥 Authors</button>
+                        <button onclick="document.getElementById('exportModal').classList.remove('hidden')" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base" title="Manage Data">💾 Data</button>
+                    </div>
+                    
+                    <button id="bulkModeBtn" onclick="toggleBulkMode()" class="bg-purple-700 hover:bg-purple-600 text-white font-bold py-2 px-3 sm:px-4 rounded transition-colors text-sm md:text-base border border-purple-600 shadow-lg flex items-center gap-2">
+                        ☑️ Bulk Edit
+                    </button>
+
+                    <button onclick="openAddModal()" class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-2 px-3 sm:px-6 rounded whitespace-nowrap text-sm md:text-base shadow-lg">
+                        + Add Prompt
+                    </button>
+                </div>
+            </div>
+
+            <div class="md:hidden text-center mb-4">
+                <span id="promptCounterMobile" class="text-yellow-400 font-bold text-sm bg-gray-800 px-3 py-1 rounded border border-gray-700">0 Prompts</span>
+            </div>
+
+            <div id="gallery" class="grid grid-cols-1 gap-4 md:gap-6 relative z-10"></div>
+            
+            <div id="loadingIndicator" class="hidden text-center py-8 text-gray-400">
+                <span class="animate-pulse">Loading more prompts...</span>
+            </div>
+        </div>
+        
+        <div id="bulkActionBar" class="fixed bottom-0 left-0 right-0 bg-gray-800 border-t-4 border-purple-600 p-4 transform translate-y-full transition-transform z-50 flex justify-center shadow-[0_-10px_25px_-5px_rgba(0,0,0,0.5)]">
+            <div class="w-full max-w-4xl flex justify-between items-center gap-4 flex-wrap">
+                <div class="font-bold text-white text-lg"><span id="bulkCount" class="text-purple-400 text-2xl">0</span> Prompts Selected</div>
+                <div class="flex gap-2">
+                    <button onclick="bulkTag()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold transition-colors">🏷️ Add Tag</button>
+                    <button onclick="bulkDelete()" class="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded font-bold transition-colors">🗑️ Delete</button>
+                    <button onclick="toggleBulkMode()" class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded font-bold transition-colors ml-4">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="templateModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-xl max-h-[90vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-2xl font-bold text-yellow-400">🧩 Fill Variables</h2>
+                    <button onclick="closeModal('templateModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <p class="text-sm text-gray-400 mb-4">Fill in the placeholders to complete your prompt.</p>
+
+                <div id="templateInputsContainer" class="flex flex-col gap-3 mb-6"></div>
+
+                <div class="bg-gray-900 p-4 rounded border border-gray-700 mb-6">
+                    <h3 class="text-xs font-bold text-gray-500 mb-2 uppercase tracking-wide">Live Preview</h3>
+                    <p id="templatePreview" class="text-sm text-gray-300 font-mono break-words"></p>
+                </div>
+
+                <input type="hidden" id="templateOriginalPrompt">
+                <input type="hidden" id="templatePromptId">
+
+                <div class="flex justify-between gap-2 mt-auto">
+                    <button type="button" onclick="copyRawTemplate(this)" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded transition-colors text-sm font-bold border border-gray-600">📋 Copy Raw</button>
+                    <div class="flex gap-2">
+                        <button type="button" onclick="closeModal('templateModal')" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded transition-colors text-sm">Cancel</button>
+                        <button type="button" onclick="executeTemplateCopy(this)" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded transition-colors text-sm shadow-lg border border-blue-600">✨ Copy Filled</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="lightboxModal" class="hidden fixed inset-0 z-[100] bg-black/95 flex items-center justify-center p-4" onclick="closeLightbox()">
+            <button onclick="closeLightbox()" class="absolute top-4 right-6 text-gray-300 hover:text-yellow-400 text-4xl font-bold z-50 transition-colors focus:outline-none">✕</button>
+            <img id="lightboxImg" src="" class="max-w-full max-h-full object-contain shadow-2xl rounded" onclick="event.stopPropagation()">
+        </div>
+
+        <div id="exportModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-md">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold">Data Management</h2>
+                    <button onclick="closeModal('exportModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                
+                <div class="mb-6 border-b border-gray-700 pb-6">
+                    <h3 class="text-lg font-bold mb-2 text-yellow-400">⬇️ Export Backup</h3>
+                    <p class="text-gray-400 text-sm mb-4">Download your prompt library. The ZIP file includes all images AND version history!</p>
+                    <div class="flex flex-col gap-3">
+                        <a href="/api/export/zip" download class="w-full bg-blue-700 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded text-center border border-blue-600 transition-colors">📦 Full Backup (.zip with images)</a>
+                        <div class="flex gap-3">
+                            <a href="/api/export/json" download class="flex-1 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded text-center border border-gray-600 transition-colors text-sm">📄 Text (.json)</a>
+                            <a href="/api/export/csv" download class="flex-1 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded text-center border border-gray-600 transition-colors text-sm">📊 Text (.csv)</a>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <h3 class="text-lg font-bold mb-2 text-green-400">⬆️ Import / Restore</h3>
+                    <p class="text-gray-400 text-sm mb-4">Upload a backup (.zip, .json, .csv). Restores prompts, images and history.</p>
+                    <input type="file" id="importFile" accept=".zip,.json,.csv" class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white text-sm">
+                    <button onclick="importData()" id="importBtn" class="w-full bg-green-700 hover:bg-green-600 text-white font-bold py-2 px-4 rounded transition-colors">Upload & Import</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="promptModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto">
+                <h2 id="modalTitle" class="text-2xl font-bold mb-4">Add New Prompt</h2>
+                <form id="promptForm" onsubmit="submitForm(event)">
+                    <input type="hidden" id="editPromptId" name="editPromptId" value="">
+                    <input type="hidden" id="formForkedFrom" name="forked_from" value="">
+                    
+                    <input type="text" id="formTitle" name="title" placeholder="Title" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white">
+                    <div class="relative w-full mb-3">
+                        <input type="text" id="formAuthor" name="author" placeholder="Author/Creator" required autocomplete="off" oninput="showAuthorSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
+                        <div id="authorSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
+                    </div>
+                    
+                    <div class="flex justify-between items-end mb-1 mt-2">
+                        <label class="text-sm font-medium text-gray-400">Tags</label>
+                        <div class="flex gap-2">
+                            <select id="tagLanguage" onchange="localStorage.setItem('nanobananaTagLanguage', this.value)" class="bg-gray-700 border border-gray-600 text-xs text-white rounded px-2 py-1 focus:outline-none focus:border-yellow-400 cursor-pointer">
+                                <option value="English">🇬🇧 English</option>
+                                <option value="German">🇩🇪 German</option>
+                                <option value="Spanish">🇪🇸 Spanish</option>
+                                <option value="French">🇫🇷 French</option>
+                            </select>
+                            <button type="button" onclick="autoGenerateTags(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                                ✨ Auto-Tag (Gemini)
+                            </button>
+                        </div>
+                    </div>
+                    <div class="relative w-full mb-3">
+                        <input type="text" id="formTags" name="tags" placeholder="Tags (comma separated)" required autocomplete="off" oninput="showTagSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
+                        <div id="tagSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
+                    </div>
+                    
+                    <div class="flex justify-between items-end mb-1">
+                        <label class="text-sm font-medium text-gray-400">Prompt Text</label>
+                        <button type="button" onclick="forceExtractPrompt(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                            ✨ Extract from Cover Image
+                        </button>
+                    </div>
+                    <textarea id="formPrompt" name="prompt" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-32"></textarea>
+                    
+                    <div id="dropZone" class="w-full p-6 mb-2 rounded bg-gray-700 border-2 border-dashed border-gray-500 text-center cursor-pointer hover:border-yellow-400 hover:bg-gray-600 transition-colors" onclick="document.getElementById('hiddenFileInput').click()">
+                        <input type="file" id="hiddenFileInput" multiple accept="image/*" class="hidden" onchange="handleFileSelect(event)">
+                        <div class="text-gray-400 pointer-events-none">
+                            <span class="text-3xl block mb-2">📸</span>
+                            <span class="font-bold text-white">Drag & Drop, Paste multiple images</span><br>or click to browse<br>
+                            <span class="text-xs text-yellow-500 mt-2 block">✨ Auto-Extracts metadata from the first image</span>
+                        </div>
+                    </div>
+                    
+                    <div id="mediaPreviews" class="flex gap-2 overflow-x-auto hide-scrollbar mb-4 py-2"></div>
+                    
+                    <div class="flex items-center mb-6">
+                        <input type="checkbox" id="is_shared" name="is_shared" value="true" checked class="w-4 h-4 text-yellow-500 bg-gray-700 border-gray-600 rounded">
+                        <label for="is_shared" class="ml-2 text-sm font-medium text-gray-300">Share with other users</label>
+                    </div>
+
+                    <div class="flex justify-end gap-2">
+                        <button type="button" onclick="closeModal('promptModal')" class="px-4 py-2 bg-gray-600 rounded">Cancel</button>
+                        <button type="submit" id="saveButton" class="px-4 py-2 bg-yellow-500 text-black font-bold rounded">Save</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div id="historyModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-2xl max-h-[90vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-2xl font-bold">Version History</h2>
+                    <button onclick="closeModal('historyModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <div id="historyContainer" class="flex-grow flex flex-col gap-4"></div>
+            </div>
+        </div>
+
+        <div id="authorsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold">Authors Directory</h2>
+                    <button onclick="closeModal('authorsModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <div id="authorsContainer" class="flex flex-wrap gap-2"></div>
+            </div>
+        </div>
+
+        <div id="tagsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold">Tags Manager</h2>
+                    <button onclick="closeModal('tagsModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <div class="bg-gray-900 p-4 rounded mb-6 border border-gray-700">
+                    <h3 class="text-lg font-bold mb-2 text-yellow-400">Merge Tags</h3>
+                    <p class="text-xs text-gray-400 mb-3">Combine similar tags (e.g. '3d' and '3D'). Updates all related prompts instantly.</p>
+                    <div class="flex flex-col sm:flex-row gap-2 items-start sm:items-center w-full">
+                        <div class="relative w-full sm:flex-1">
+                            <input type="text" id="mergeOldTag" placeholder="Search old tag..." autocomplete="off" oninput="showMergeOldTagSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-yellow-400">
+                            <div id="mergeOldTagSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
+                        </div>
+                        <span class="text-gray-400 hidden sm:inline px-2">➔</span>
+                        <div class="relative w-full sm:flex-1">
+                            <input type="text" id="mergeNewTag" placeholder="Search or type new tag..." autocomplete="off" oninput="showMergeNewTagSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-yellow-400">
+                            <div id="mergeNewTagSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
+                        </div>
+                        <button onclick="mergeTags()" id="mergeTagBtn" class="w-full sm:w-auto bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-2 px-4 rounded transition-colors text-sm">Merge</button>
+                    </div>
+                </div>
+                <h3 class="text-lg font-bold mb-3 border-b border-gray-700 pb-2">All Tags</h3>
+                <div id="tagsContainer" class="flex flex-wrap gap-2"></div>
+            </div>
+        </div>
+
+        <script>
+            let globalPrompts = [];
+            let displayPrompts = [];
+            let uniqueAuthors = [];
+            let uniqueTags = [];
+            
+            let renderIndex = 0;
+            const BATCH_SIZE = 24; 
+            
+            let showOnlyFavorites = false;
+            let mediaItems = []; 
+            
+            let isBulkMode = false;
+            let selectedPrompts = new Set();
+
+            function escapeHTML(str) {
+                if (!str) return '';
+                return str.replace(/[&<>'"]/g, 
+                    tag => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[tag] || tag)
+                );
+            }
+
+            function encodeForJS(str) {
+                if (!str) return '';
+                return encodeURIComponent(str).replace(/'/g, "%27");
+            }
+            
+            function escapeRegExp(string) {
+              return string.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&');
+            }
+
+            // --- BULK MODE LOGIK ---
+            function toggleBulkMode() {
+                isBulkMode = !isBulkMode;
+                selectedPrompts.clear();
+                
+                const btn = document.getElementById('bulkModeBtn');
+                const bar = document.getElementById('bulkActionBar');
+                
+                if (isBulkMode) {
+                    btn.classList.replace('bg-purple-700', 'bg-purple-500');
+                    bar.classList.remove('translate-y-full');
+                } else {
+                    btn.classList.replace('bg-purple-500', 'bg-purple-700');
+                    bar.classList.add('translate-y-full');
+                }
+                
+                const currentScroll = window.scrollY;
+                document.getElementById('gallery').innerHTML = '';
+                renderIndex = 0;
+                renderNextBatch();
+                
+                setTimeout(() => window.scrollTo(0, currentScroll), 10);
+                updateBulkCount();
+            }
+
+            function toggleBulkSelection(id, isChecked) {
+                if (isChecked) selectedPrompts.add(id);
+                else selectedPrompts.delete(id);
+                updateBulkCount();
+            }
+
+            function updateBulkCount() {
+                document.getElementById('bulkCount').innerText = selectedPrompts.size;
+            }
+
+            async function bulkDelete() {
+                if (selectedPrompts.size === 0) return alert("Please select at least one prompt.");
+                if (!confirm(`Are you sure you want to permanently delete ${selectedPrompts.size} prompts?`)) return;
+                
+                const formData = new FormData();
+                formData.append('prompt_ids', Array.from(selectedPrompts).join(','));
+                
+                try {
+                    await fetch('/api/prompts/bulk/delete', { method: 'POST', body: formData });
+                    toggleBulkMode();
+                    fetchPrompts();
+                } catch(e) { alert("Bulk delete failed."); }
+            }
+
+            async function bulkTag() {
+                if (selectedPrompts.size === 0) return alert("Please select at least one prompt.");
+                const newTag = prompt(`Enter a new tag to add to ${selectedPrompts.size} prompts:`);
+                if (!newTag || !newTag.trim()) return;
+                
+                const formData = new FormData();
+                formData.append('prompt_ids', Array.from(selectedPrompts).join(','));
+                formData.append('new_tag', newTag.trim());
+                
+                try {
+                    const res = await fetch('/api/prompts/bulk/tag', { method: 'POST', body: formData });
+                    if(!res.ok) throw new Error();
+                    toggleBulkMode();
+                    fetchPrompts();
+                } catch(e) { alert("Bulk tagging failed."); }
+            }
+
+            // --- TEMPLATE SYSTEM (LÜCKENTEXT) ---
+            function openTemplateModal(promptId, customText = null) {
+                let text = customText;
+                if (!text) {
+                    const p = globalPrompts.find(x => x.id === promptId);
+                    if(!p) return;
+                    text = p.prompt;
+                }
+
+                const matches = [...text.matchAll(/\\[(.*?)\\]/g)];
+                const uniquePlaceholders = [...new Set(matches.map(m => m[1]))];
+
+                const container = document.getElementById('templateInputsContainer');
+                container.innerHTML = '';
+                
+                uniquePlaceholders.forEach(ph => {
+                    container.innerHTML += `
+                        <div>
+                            <label class="block text-xs font-bold text-blue-400 mb-1 tracking-wider uppercase">${escapeHTML(ph)}</label>
+                            <input type="text" data-placeholder="${escapeHTML(ph)}" oninput="updateTemplatePreview()" 
+                                   class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white placeholder-input focus:outline-none focus:border-blue-400" 
+                                   placeholder="Type here...">
+                        </div>
+                    `;
+                });
+
+                document.getElementById('templateOriginalPrompt').value = text;
+                document.getElementById('templatePromptId').value = promptId || '';
+
+                updateTemplatePreview();
+                document.getElementById('templateModal').classList.remove('hidden');
+                
+                const firstInput = container.querySelector('input');
+                if(firstInput) setTimeout(() => firstInput.focus(), 100);
+            }
+
+            function updateTemplatePreview() {
+                const originalText = document.getElementById('templateOriginalPrompt').value;
+                let finalText = originalText;
+                
+                const inputs = document.querySelectorAll('.placeholder-input');
+                inputs.forEach(input => {
+                    const ph = input.getAttribute('data-placeholder');
+                    const val = input.value || '[' + ph + ']';
+                    const regex = new RegExp('\\\\[' + escapeRegExp(ph) + '\\\\]', 'g');
+                    
+                    const displayVal = input.value ? `<span class="text-green-400 font-bold">${escapeHTML(val)}</span>` : `<span class="text-blue-400">[${escapeHTML(ph)}]</span>`;
+                    finalText = finalText.replace(regex, displayVal);
+                });
+                
+                document.getElementById('templatePreview').innerHTML = finalText.replace(/\\n/g, '<br>');
+            }
+            
+            function copyRawTemplate(btn) {
+                const text = document.getElementById('templateOriginalPrompt').value;
+                const pid = document.getElementById('templatePromptId').value;
+                executeCopyFinal(btn, text, pid);
+            }
+
+            function executeTemplateCopy(btn) {
+                const originalText = document.getElementById('templateOriginalPrompt').value;
+                const promptId = document.getElementById('templatePromptId').value;
+                let finalText = originalText;
+
+                const inputs = document.querySelectorAll('.placeholder-input');
+                inputs.forEach(input => {
+                    const ph = input.getAttribute('data-placeholder');
+                    const val = input.value || '[' + ph + ']';
+                    const regex = new RegExp('\\\\[' + escapeRegExp(ph) + '\\\\]', 'g');
+                    finalText = finalText.replace(regex, val);
+                });
+
+                executeCopyFinal(btn, finalText, promptId);
+            }
+            
+            function executeCopyFinal(btn, textToCopy, promptId) {
+                navigator.clipboard.writeText(textToCopy);
+                
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '✅ Copied!';
+                btn.classList.add('bg-green-600', 'text-white', 'border-green-600');
+                
+                if (promptId) {
+                    try {
+                        fetch(`/api/prompts/${promptId}/copy`, { method: 'POST' });
+                        const p = globalPrompts.find(x => x.id === promptId);
+                        if (p) {
+                            p.copy_count = (p.copy_count || 0) + 1;
+                            const countSpan = document.getElementById(`count-${promptId}`);
+                            if (countSpan) countSpan.innerText = p.copy_count;
+                        }
+                    } catch(e) {}
+                }
+
+                setTimeout(() => {
+                    btn.innerHTML = originalText;
+                    btn.classList.remove('bg-green-600', 'text-white', 'border-green-600');
+                    closeModal('templateModal');
+                }, 1000);
+            }
+
+            function openLightbox(src) {
+                document.getElementById('lightboxImg').src = src;
+                document.getElementById('lightboxModal').classList.remove('hidden');
+            }
+            function closeLightbox() {
+                document.getElementById('lightboxModal').classList.add('hidden');
+                document.getElementById('lightboxImg').src = '';
+            }
+
+            function toggleFavFilter() {
+                showOnlyFavorites = !showOnlyFavorites;
+                const btn = document.getElementById('filterFavBtn');
+                if(showOnlyFavorites) {
+                    btn.classList.replace('text-gray-300', 'text-red-400');
+                    btn.innerHTML = '❤️ Favorites';
+                } else {
+                    btn.classList.replace('text-red-400', 'text-gray-300');
+                    btn.innerHTML = '🤍 Favorites';
+                }
+                triggerRenderReset();
+            }
+
+            async function toggleFavorite(id) {
+                const res = await fetch(`/api/prompts/${id}/favorite`, {method: 'POST'});
+                if(res.ok) {
+                    const data = await res.json();
+                    const p = globalPrompts.find(x => x.id === id);
+                    if(p) p.is_favorite = data.is_favorite;
+                    
+                    const btn = document.getElementById('fav-btn-' + id);
+                    if(btn) {
+                        btn.innerText = data.is_favorite ? '❤️' : '🤍';
+                        btn.classList.add('scale-125');
+                        setTimeout(() => btn.classList.remove('scale-125'), 200);
+                    }
+                    if(showOnlyFavorites && !data.is_favorite) triggerRenderReset();
+                }
+            }
+
+            async function importData() {
+                const fileInput = document.getElementById('importFile');
+                if (!fileInput.files.length) { alert("Please select a file first."); return; }
+                
+                const btn = document.getElementById('importBtn');
+                btn.innerText = 'Importing...'; btn.disabled = true;
+                
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                
+                try {
+                    const res = await fetch('/api/import', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const data = await res.json();
+                        alert(`Successfully imported ${data.added} prompts and ${data.added_history} history entries!`);
+                        closeModal('exportModal');
+                        fetchPrompts();
+                    } else {
+                        const err = await res.json();
+                        alert('Error: ' + err.detail);
+                    }
+                } catch(e) {
+                    alert('Import failed.');
+                }
+                
+                btn.innerText = 'Upload & Import'; btn.disabled = false;
+                fileInput.value = '';
+            }
+
+            function extractAutocompleteData() {
+                const authorsSet = new Set();
+                const tagsSet = new Set();
+                globalPrompts.forEach(p => {
+                    if (p.author) authorsSet.add(p.author.trim());
+                    if (p.tags) {
+                        p.tags.split(',').forEach(t => {
+                            const cleanTag = t.trim();
+                            if(cleanTag) tagsSet.add(cleanTag);
+                        });
+                    }
+                });
+                uniqueAuthors = Array.from(authorsSet).sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+                uniqueTags = Array.from(tagsSet).sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+            }
+
+            function showAuthorSuggestions(val) {
+                const container = document.getElementById('authorSuggestions');
+                if(!val) { container.classList.add('hidden'); return; }
+                const matches = uniqueAuthors.filter(a => a.toLowerCase().includes(val.toLowerCase()) && a.toLowerCase() !== val.toLowerCase());
+                if(matches.length === 0) { container.classList.add('hidden'); return; }
+                container.innerHTML = matches.map(m => `
+                    <div class="p-2 cursor-pointer hover:bg-yellow-500 hover:text-black transition-colors" onclick="selectAuthor(decodeURIComponent('${encodeForJS(m)}'))">${escapeHTML(m)}</div>
+                `).join('');
+                container.classList.remove('hidden');
+            }
+
+            function selectAuthor(val) {
+                document.getElementById('formAuthor').value = val;
+                document.getElementById('authorSuggestions').classList.add('hidden');
+            }
+
+            function showTagSuggestions(val) {
+                const container = document.getElementById('tagSuggestions');
+                if(!val) { container.classList.add('hidden'); return; }
+                const parts = val.split(',');
+                const currentTag = parts[parts.length - 1].trim(); 
+                if(!currentTag) { container.classList.add('hidden'); return; }
+                const matches = uniqueTags.filter(t => t.toLowerCase().includes(currentTag.toLowerCase()) && t.toLowerCase() !== currentTag.toLowerCase());
+                if(matches.length === 0) { container.classList.add('hidden'); return; }
+                container.innerHTML = matches.map(m => `
+                    <div class="p-2 cursor-pointer hover:bg-yellow-500 hover:text-black transition-colors" onclick="selectTag(decodeURIComponent('${encodeForJS(m)}'))">${escapeHTML(m)}</div>
+                `).join('');
+                container.classList.remove('hidden');
+            }
+
+            function selectTag(selectedTag) {
+                const input = document.getElementById('formTags');
+                const parts = input.value.split(',');
+                parts.pop(); 
+                parts.push(' ' + selectedTag);
+                input.value = parts.join(',').trim() + ', '; 
+                document.getElementById('tagSuggestions').classList.add('hidden');
+                input.focus();
+            }
+            
+            function showMergeOldTagSuggestions(val) {
+                const container = document.getElementById('mergeOldTagSuggestions');
+                if(!val) { container.classList.add('hidden'); return; }
+                const matches = uniqueTags.filter(t => t.toLowerCase().includes(val.toLowerCase()) && t.toLowerCase() !== val.toLowerCase());
+                if(matches.length === 0) { container.classList.add('hidden'); return; }
+                container.innerHTML = matches.map(m => `
+                    <div class="p-2 cursor-pointer hover:bg-yellow-500 hover:text-black transition-colors" onclick="selectMergeOldTag(decodeURIComponent('${encodeForJS(m)}'))">${escapeHTML(m)}</div>
+                `).join('');
+                container.classList.remove('hidden');
+            }
+
+            function selectMergeOldTag(val) {
+                document.getElementById('mergeOldTag').value = val;
+                document.getElementById('mergeOldTagSuggestions').classList.add('hidden');
+            }
+
+            function showMergeNewTagSuggestions(val) {
+                const container = document.getElementById('mergeNewTagSuggestions');
+                if(!val) { container.classList.add('hidden'); return; }
+                const matches = uniqueTags.filter(t => t.toLowerCase().includes(val.toLowerCase()) && t.toLowerCase() !== val.toLowerCase());
+                if(matches.length === 0) { container.classList.add('hidden'); return; }
+                container.innerHTML = matches.map(m => `
+                    <div class="p-2 cursor-pointer hover:bg-yellow-500 hover:text-black transition-colors" onclick="selectMergeNewTag(decodeURIComponent('${encodeForJS(m)}'))">${escapeHTML(m)}</div>
+                `).join('');
+                container.classList.remove('hidden');
+            }
+
+            function selectMergeNewTag(val) {
+                document.getElementById('mergeNewTag').value = val;
+                document.getElementById('mergeNewTagSuggestions').classList.add('hidden');
+            }
+
+            document.addEventListener('click', function(e) {
+                if(e.target.id !== 'formAuthor') document.getElementById('authorSuggestions')?.classList.add('hidden');
+                if(e.target.id !== 'formTags') document.getElementById('tagSuggestions')?.classList.add('hidden');
+                if(e.target.id !== 'mergeOldTag') document.getElementById('mergeOldTagSuggestions')?.classList.add('hidden');
+                if(e.target.id !== 'mergeNewTag') document.getElementById('mergeNewTagSuggestions')?.classList.add('hidden');
+            });
+
+            const dropZone = document.getElementById('dropZone');
+
+            dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('border-yellow-400', 'bg-gray-600'); });
+            dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); dropZone.classList.remove('border-yellow-400', 'bg-gray-600'); });
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault(); dropZone.classList.remove('border-yellow-400', 'bg-gray-600');
+                if (e.dataTransfer.files.length) handleFiles(Array.from(e.dataTransfer.files));
+            });
+
+            function handleFileSelect(e) {
+                if (e.target.files.length) handleFiles(Array.from(e.target.files));
+                e.target.value = ''; 
+            }
+
+            document.addEventListener('paste', (e) => {
+                const promptModal = document.getElementById('promptModal');
+                if (promptModal.classList.contains('hidden')) return;
+                if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0) {
+                    e.preventDefault();
+                    handleFiles(Array.from(e.clipboardData.files));
+                }
+            });
+
+            dropZone.addEventListener('contextmenu', async (e) => {
+                e.preventDefault(); e.stopPropagation();
+                try {
+                    const clipboardItems = await navigator.clipboard.read();
+                    for (const item of clipboardItems) {
+                        const imageTypes = item.types.filter(type => type.startsWith('image/'));
+                        if (imageTypes.length > 0) {
+                            const blob = await item.getType(imageTypes[0]);
+                            const file = new File([blob], "pasted-image.png", { type: blob.type });
+                            handleFiles([file]);
+                            return; 
+                        }
+                    }
+                    alert("No image found in clipboard.");
+                } catch (err) {
+                    alert("Clipboard access denied. Please use Ctrl+V / Cmd+V instead.");
+                }
+            });
+
+            function handleFiles(files) {
+                const imgFiles = files.filter(f => f.type.startsWith('image/'));
+                if (imgFiles.length === 0) return;
+                extractMetadata(imgFiles[0]); 
+                imgFiles.forEach(file => {
+                    const isFirstEver = mediaItems.length === 0;
+                    const url = URL.createObjectURL(file);
+                    mediaItems.push({ type: 'new', val: file, url: url, isCover: isFirstEver });
+                });
+                renderMediaPreviews();
+            }
+
+            function renderMediaPreviews() {
+                const container = document.getElementById('mediaPreviews');
+                if (mediaItems.length === 0) { container.innerHTML = ''; return; }
+                container.innerHTML = mediaItems.map((item, index) => `
+                    <div class="relative w-24 h-24 flex-shrink-0 rounded overflow-hidden border-2 transition-colors ${item.isCover ? 'border-yellow-400' : 'border-gray-600'}">
+                        <img src="${item.url}" class="w-full h-full object-cover">
+                        <div class="absolute top-0 right-0 bg-black/80 flex rounded-bl">
+                            <button type="button" onclick="event.stopPropagation(); setCover(${index})" class="px-2 py-1 hover:text-yellow-400 text-xs transition-colors ${item.isCover ? 'text-yellow-400' : 'text-gray-400'}">⭐</button>
+                            <button type="button" onclick="event.stopPropagation(); removeMedia(${index})" class="px-2 py-1 hover:text-red-500 text-gray-400 text-xs transition-colors">✕</button>
+                        </div>
+                        ${item.isCover ? '<div class="absolute bottom-0 left-0 right-0 bg-yellow-400 text-black text-[10px] text-center font-bold">COVER</div>' : ''}
+                    </div>
+                `).join('');
+            }
+
+            function setCover(index) {
+                mediaItems.forEach(m => m.isCover = false);
+                mediaItems[index].isCover = true;
+                const coverItem = mediaItems.splice(index, 1)[0];
+                mediaItems.unshift(coverItem);
+                renderMediaPreviews();
+            }
+
+            function removeMedia(index) {
+                const removed = mediaItems.splice(index, 1)[0];
+                if (removed.type === 'new') URL.revokeObjectURL(removed.url); 
+                if (removed.isCover && mediaItems.length > 0) mediaItems[0].isCover = true;
+                renderMediaPreviews();
+            }
+
+            async function forceExtractPrompt(btn) {
+                const promptField = document.getElementById('formPrompt');
+                if (mediaItems.length === 0) { alert("Please add an image first."); return; }
+                if (promptField.value.trim() !== '') {
+                    if (!confirm("This will overwrite your current prompt text. Continue?")) return;
+                }
+
+                const targetMedia = mediaItems.find(m => m.isCover) || mediaItems[0];
+                const formData = new FormData();
+                if (targetMedia.type === 'new') formData.append('image', targetMedia.val);
+                else formData.append('existing_image', targetMedia.val);
+
+                const originalText = btn.innerText;
+                btn.innerText = '⏳ Extracting...'; btn.disabled = true;
+
+                try {
+                    const res = await fetch('/api/extract-metadata', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.extracted_prompt) {
+                            promptField.value = data.extracted_prompt;
+                            promptField.classList.remove('flash-success');
+                            void promptField.offsetWidth; 
+                            promptField.classList.add('flash-success');
+                        } else { alert("No metadata/prompt found in this image."); }
+                    } else { alert("Failed to extract metadata."); }
+                } catch (e) { alert("Error extracting metadata."); }
+                
+                btn.innerText = originalText; btn.disabled = false;
+            }
+
+            async function extractMetadata(file) {
+                const promptField = document.getElementById('formPrompt');
+                if (promptField.value.trim() !== '') return;
+                const formData = new FormData();
+                formData.append('image', file);
+                try {
+                    const res = await fetch('/api/extract-metadata', { method: 'POST', body: formData });
+                    if(res.ok) {
+                        const data = await res.json();
+                        if (data.extracted_prompt && promptField.value.trim() === '') {
+                            promptField.value = data.extracted_prompt;
+                            promptField.classList.remove('flash-success');
+                            void promptField.offsetWidth; 
+                            promptField.classList.add('flash-success');
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            async function autoGenerateTags(btn) {
+                const promptField = document.getElementById('formPrompt');
+                const tagsField = document.getElementById('formTags');
+                const langField = document.getElementById('tagLanguage');
+                
+                if (!promptField.value.trim()) { 
+                    alert("Please enter or extract a prompt text first so Gemini knows what to tag!"); 
+                    return; 
+                }
+                
+                const originalText = btn.innerText;
+                btn.innerText = '⏳ Generating...'; 
+                btn.disabled = true;
+                
+                const formData = new FormData();
+                formData.append('prompt', promptField.value);
+                formData.append('language', langField.value);
+                
+                try {
+                    const res = await fetch('/api/tags/auto', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.tags) {
+                            let currentTags = tagsField.value.split(',').map(t => t.trim()).filter(t => t);
+                            let newTags = data.tags.split(',').map(t => t.trim()).filter(t => t);
+                            let combined = [...new Set([...currentTags, ...newTags])];
+                            
+                            tagsField.value = combined.join(', ') + (combined.length > 0 ? ', ' : '');
+                            
+                            tagsField.classList.remove('flash-success');
+                            void tagsField.offsetWidth; 
+                            tagsField.classList.add('flash-success');
+                        }
+                    } else {
+                        const err = await res.json();
+                        alert("Error generating tags: " + err.detail);
+                    }
+                } catch (e) { 
+                    alert("Failed to connect to Auto-Tag API."); 
+                }
+                
+                btn.innerText = originalText; 
+                btn.disabled = false;
+            }
+
+            function updateCarouselCounter(id, total) {
+                const container = document.getElementById('carousel-' + id);
+                const counter = document.getElementById('carousel-counter-' + id);
+                if (container && counter) {
+                    const index = Math.round(container.scrollLeft / container.clientWidth) + 1;
+                    counter.innerText = `${index} / ${total} 📸`;
+                }
+            }
+
+            function scrollCarousel(id, direction) {
+                const container = document.getElementById('carousel-' + id);
+                if (container) {
+                    const scrollAmount = container.offsetWidth;
+                    container.scrollBy({ left: direction * scrollAmount, behavior: 'smooth' });
+                }
+            }
+
+            function triggerSearch(term) {
+                if(term && (term.startsWith('tag:') || term.startsWith('author:'))) {
+                    const current = document.getElementById('searchInput').value.trim();
+                    if(!current.includes(term)) {
+                        document.getElementById('searchInput').value = current ? current + ' ' + term : term;
+                    }
+                } else {
+                    document.getElementById('searchInput').value = term;
+                }
+                triggerRenderReset();
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+
+            function clearSearch() {
+                document.getElementById('searchInput').value = '';
+                triggerRenderReset();
+            }
+
+            function applySort() {
+                localStorage.setItem('nanobananaSort', document.getElementById('sortSelect').value);
+                triggerRenderReset();
+            }
+
+            function setLayout(cols) {
+                localStorage.setItem('nanobananaLayoutCols', cols);
+                const gallery = document.getElementById('gallery');
+                
+                gallery.className = 'grid gap-4 md:gap-6 relative z-10';
+                
+                if(cols === 1) gallery.classList.add('grid-cols-1');
+                if(cols === 2) gallery.classList.add('grid-cols-2');
+                if(cols === 3) gallery.classList.add('grid-cols-3');
+                if(cols === 4) gallery.classList.add('grid-cols-4');
+                if(cols === 5) gallery.classList.add('grid-cols-5');
+                if(cols === 6) gallery.classList.add('grid-cols-6');
+                if(cols === 7) gallery.classList.add('grid-cols-7');
+                if(cols === 8) gallery.classList.add('grid-cols-8');
+
+                const layoutSelect = document.getElementById('layoutSelect');
+                if(layoutSelect) layoutSelect.value = cols;
+            }
+
+            async function fetchPrompts() {
+                const res = await fetch('/api/prompts');
+                if (res.status === 401) window.location.reload();
+                globalPrompts = await res.json();
+                
+                extractAutocompleteData(); 
+                triggerRenderReset();
+            }
+
+            function triggerRenderReset() {
+                const search = document.getElementById('searchInput').value.trim();
+                const sortVal = localStorage.getItem('nanobananaSort') || 'newest';
+                document.getElementById('sortSelect').value = sortVal;
+
+                const terms = search.split(/\s+/).filter(t => t.length > 0);
+
+                displayPrompts = globalPrompts.filter(p => {
+                    if(showOnlyFavorites && !p.is_favorite) return false;
+                    if(terms.length === 0) return true;
+
+                    let matchesAll = true;
+                    for(let term of terms) {
+                        const isNegation = term.startsWith('-');
+                        const actualTerm = isNegation ? term.substring(1).toLowerCase() : term.toLowerCase();
+                        let termMatch = false;
+
+                        if (actualTerm.startsWith('tag:')) {
+                            const tagVal = actualTerm.substring(4);
+                            const hasTag = p.tags.toLowerCase().includes(tagVal);
+                            termMatch = isNegation ? !hasTag : hasTag;
+                        } else if (actualTerm.startsWith('author:')) {
+                            const authVal = actualTerm.substring(7);
+                            const hasAuth = p.author.toLowerCase().includes(authVal);
+                            termMatch = isNegation ? !hasAuth : hasAuth;
+                        } else if (actualTerm === 'is:favorite') {
+                            termMatch = isNegation ? !p.is_favorite : p.is_favorite;
+                        } else if (actualTerm === 'is:mine') {
+                            termMatch = isNegation ? !p.is_mine : p.is_mine;
+                        } else if (actualTerm === 'is:shared') {
+                            termMatch = isNegation ? !p.is_shared : p.is_shared;
+                        } else {
+                            const textToSearch = (p.title + " " + p.prompt + " " + p.tags + " " + p.author).toLowerCase();
+                            // HIER GEFIXT: Findet das gesuchte Wort ODER falls die exakte ID des Prompts gesucht wird
+                            const hasText = textToSearch.includes(actualTerm) || p.id === actualTerm;
+                            termMatch = isNegation ? !hasText : hasText;
+                        }
+
+                        if (!termMatch) {
+                            matchesAll = false;
+                            break;
+                        }
+                    }
+                    return matchesAll;
+                });
+
+                if (sortVal === 'oldest') {
+                    displayPrompts.reverse(); 
+                } else if (sortVal === 'most_copied') {
+                    displayPrompts.sort((a, b) => (b.copy_count || 0) - (a.copy_count || 0));
+                } else if (sortVal === 'least_copied') {
+                    displayPrompts.sort((a, b) => (a.copy_count || 0) - (b.copy_count || 0));
+                }
+
+                document.getElementById('promptCounter').innerText = displayPrompts.length + " Prompts";
+
+                document.getElementById('gallery').innerHTML = '';
+                renderIndex = 0;
+                renderNextBatch();
+            }
+
+            function parseImages(pathRaw) {
+                try {
+                    const arr = JSON.parse(pathRaw);
+                    if (Array.isArray(arr)) return arr;
+                    return [pathRaw];
+                } catch(e) {
+                    return [pathRaw];
+                }
+            }
+
+            function renderNextBatch() {
+                const gallery = document.getElementById('gallery');
+                const batch = displayPrompts.slice(renderIndex, renderIndex + BATCH_SIZE);
+                
+                if (batch.length === 0) {
+                    document.getElementById('loadingIndicator').classList.add('hidden');
+                    return;
+                }
+
+                let htmlChunk = '';
+
+                batch.forEach(p => {
+                    const safeTitle = escapeHTML(p.title);
+                    const safeAuthor = escapeHTML(p.author);
+                    const safePrompt = escapeHTML(p.prompt);
+
+                    const tagsHtml = p.tags.split(',').map(t => {
+                        const rawTag = t.trim();
+                        if(!rawTag) return '';
+                        const safeTag = escapeHTML(rawTag);
+                        return `<button onclick="triggerSearch(decodeURIComponent('tag:${encodeForJS(rawTag)}'))" class="bg-gray-700 hover:bg-yellow-500 hover:text-black transition-colors text-xs px-2 py-1 rounded truncate max-w-full cursor-pointer focus:outline-none">${safeTag}</button>`;
+                    }).join(' ');
+                    
+                    let badge = p.is_mine 
+                        ? (p.is_shared ? '<span class="absolute top-2 right-2 bg-blue-600 text-white text-xs px-2 py-1 rounded shadow z-10">My Shared Prompt</span>' 
+                                       : '<span class="absolute top-2 right-2 bg-gray-900 text-white text-xs px-2 py-1 rounded shadow border border-gray-700 z-10">Private</span>')
+                        : '<span class="absolute top-2 right-2 bg-green-600 text-white text-xs px-2 py-1 rounded shadow truncate max-w-[80%] z-10">Shared by ' + escapeHTML(p.user_email) + '</span>';
+
+                    const deleteBtn = p.is_mine ? `<button onclick="deletePrompt('${p.id}')" class="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-1 px-2 rounded text-sm transition-colors border border-red-800">Delete</button>` : '';
+
+                    // HIER NEU: Fork Button neben den anderen Aktionen
+                    let actionButtons = `
+                        <div class="flex flex-wrap gap-2 mt-2">
+                            <button onclick="forkPrompt('${p.id}')" class="flex-1 bg-purple-900 hover:bg-purple-800 text-purple-200 py-1 px-2 rounded text-sm transition-colors border border-purple-800" title="Copy as new prompt">🍴 Fork</button>
+                            <button onclick="openEditModal('${p.id}')" class="flex-1 bg-blue-900 hover:bg-blue-800 text-blue-200 py-1 px-2 rounded text-sm transition-colors border border-blue-800">Edit</button>
+                            <button onclick="openHistoryModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600">History</button>
+                            ${deleteBtn}
+                        </div>
+                    `;
+
+                    const tooltipPrompt = safePrompt.replace(/"/g, '&quot;');
+                    const copyCount = p.copy_count || 0;
+                    
+                    const images = parseImages(p.image_path);
+                    const isMulti = images.length > 1;
+                    
+                    let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
+                    images.forEach(img => {
+                        carouselHtml += `<img src="/images/${img}" onclick="if(!isBulkMode) openLightbox('/images/${img}')" loading="lazy" class="snap-center min-w-full h-full object-cover bg-gray-900 ${isBulkMode ? 'cursor-pointer' : 'cursor-zoom-in'}" title="${tooltipPrompt}">`;
+                    });
+                    carouselHtml += `</div>`;
+                    
+                    if (isMulti) {
+                        carouselHtml += `
+                            <button onclick="event.stopPropagation(); scrollCarousel('${p.id}', -1)" class="absolute left-2 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black text-white w-8 h-8 rounded-full flex items-center justify-center opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none">◀</button>
+                            <button onclick="event.stopPropagation(); scrollCarousel('${p.id}', 1)" class="absolute right-2 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black text-white w-8 h-8 rounded-full flex items-center justify-center opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none">▶</button>
+                            <div id="carousel-counter-${p.id}" class="absolute bottom-2 right-2 bg-black/70 text-[10px] px-2 py-0.5 rounded text-white z-10 pointer-events-none transition-opacity">1 / ${images.length} 📸</div>
+                        `;
+                    }
+                    
+                    const favIcon = p.is_favorite ? '❤️' : '🤍';
+                    
+                    const hasPlaceholders = /\\[(.*?)\\]/.test(p.prompt);
+                    let mainCopyBtn = '';
+                    if(hasPlaceholders) {
+                        mainCopyBtn = `
+                            <button onclick="openTemplateModal('${p.id}')" 
+                                    title="Fill in variables"
+                                    class="w-full bg-blue-700 hover:bg-blue-600 py-2 rounded text-sm sm:text-base font-bold transition-colors cursor-pointer mt-auto border border-blue-600 flex items-center justify-center gap-2">
+                                🧩 Fill & Copy
+                            </button>
+                        `;
+                    } else {
+                        mainCopyBtn = `
+                            <button onclick="copyToClipboard(this, decodeURIComponent('${encodeForJS(p.prompt)}'), '${p.id}')" 
+                                    title="${tooltipPrompt}"
+                                    class="w-full bg-gray-700 hover:bg-gray-600 py-2 rounded text-sm sm:text-base font-bold transition-colors cursor-pointer mt-auto">
+                                📋 Copy Prompt
+                            </button>
+                        `;
+                    }
+
+                    const bulkCheckboxHtml = `
+                        <div class="absolute top-2 left-2 z-20 bulk-checkbox-container" style="display: ${isBulkMode ? 'block' : 'none'};">
+                            <input type="checkbox" class="w-6 h-6 rounded border-gray-600 cursor-pointer shadow-lg outline-none ring-2 ring-purple-500 ring-offset-2 ring-offset-gray-800" 
+                                   onchange="toggleBulkSelection('${p.id}', this.checked)" 
+                                   ${selectedPrompts.has(p.id) ? 'checked' : ''}>
+                        </div>
+                    `;
+
+                    // HIER NEU: Visueller Marker für geforkte Prompts
+                    let forkBadge = '';
+                    if (p.forked_from) {
+                        const parentTitle = p.forked_from_title ? escapeHTML(p.forked_from_title) : 'Deleted Prompt';
+                        forkBadge = `
+                            <div class="text-xs text-purple-400 mb-2 flex items-center gap-1 font-medium cursor-pointer hover:text-purple-300" onclick="triggerSearch('${p.forked_from}')" title="Show Original Parent">
+                                🍴 Forked from: <span class="truncate max-w-[200px] border-b border-purple-800 border-dashed">${parentTitle}</span>
+                            </div>`;
+                    }
+
+                    htmlChunk += `
+                        <div class="bg-gray-800 rounded-lg overflow-hidden border ${selectedPrompts.has(p.id) ? 'border-purple-500' : 'border-gray-700'} shadow-lg flex flex-col relative group transition-colors" id="card-${p.id}">
+                            ${badge}
+                            ${bulkCheckboxHtml}
+                            
+                            <div class="relative w-full aspect-square group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); }">
+                                ${carouselHtml}
+                            </div>
+                            
+                            <div class="p-3 sm:p-4 flex flex-col flex-grow">
+                                ${forkBadge}
+                                <div class="flex justify-between items-start mb-1 gap-2">
+                                    <h3 class="text-lg sm:text-xl font-bold truncate flex-grow">${safeTitle}</h3>
+                                    <div class="flex items-center gap-2 flex-shrink-0">
+                                        <button onclick="toggleFavorite('${p.id}')" id="fav-btn-${p.id}" class="text-xl hover:scale-110 transition-transform focus:outline-none" title="Toggle Favorite">${favIcon}</button>
+                                        <div class="bg-gray-900 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-400 font-bold" title="Times copied">
+                                            📋 <span id="count-${p.id}">${copyCount}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <p class="text-xs sm:text-sm text-gray-400 mb-2 sm:mb-3 truncate">
+                                    Author: <button onclick="triggerSearch(decodeURIComponent('author:${encodeForJS(p.author)}'))" class="hover:text-yellow-400 underline decoration-gray-600 hover:decoration-yellow-400 transition-colors cursor-pointer focus:outline-none">${safeAuthor}</button>
+                                </p>
+                                
+                                <div class="flex flex-wrap gap-1 mb-3 sm:mb-4 flex-grow content-start">${tagsHtml}</div>
+                                
+                                ${mainCopyBtn}
+                                ${actionButtons}
+                            </div>
+                        </div>
+                    `;
+                });
+
+                gallery.insertAdjacentHTML('beforeend', htmlChunk);
+                renderIndex += BATCH_SIZE;
+
+                if (renderIndex < displayPrompts.length) {
+                    document.getElementById('loadingIndicator').classList.remove('hidden');
+                } else {
+                    document.getElementById('loadingIndicator').classList.add('hidden');
+                }
+            }
+
+            window.addEventListener('scroll', () => {
+                if ((window.innerHeight + window.scrollY) >= document.body.offsetHeight - 500) {
+                    if (renderIndex < displayPrompts.length) renderNextBatch();
+                }
+            });
+
+            function openAddModal() {
+                document.getElementById('modalTitle').innerText = 'Add New Prompt';
+                document.getElementById('editPromptId').value = '';
+                document.getElementById('formForkedFrom').value = ''; // Reset Fork ID
+                document.getElementById('promptForm').reset();
+                document.getElementById('is_shared').checked = true;
+                
+                const savedLang = localStorage.getItem('nanobananaTagLanguage');
+                if(savedLang) document.getElementById('tagLanguage').value = savedLang;
+                
+                mediaItems = [];
+                renderMediaPreviews();
+                
+                document.getElementById('promptModal').classList.remove('hidden');
+            }
+
+            function openEditModal(id) {
+                const p = globalPrompts.find(x => x.id === id);
+                if(!p) return;
+                
+                document.getElementById('modalTitle').innerText = 'Edit Prompt (Wiki Mode)';
+                document.getElementById('editPromptId').value = p.id;
+                document.getElementById('formForkedFrom').value = ''; // Reset Fork ID
+                document.getElementById('formTitle').value = p.title;
+                document.getElementById('formAuthor').value = p.author;
+                document.getElementById('formTags').value = p.tags;
+                document.getElementById('formPrompt').value = p.prompt;
+                document.getElementById('is_shared').checked = (p.is_shared === 1);
+                document.getElementById('is_shared').disabled = !p.is_mine;
+                
+                const savedLang = localStorage.getItem('nanobananaTagLanguage');
+                if(savedLang) document.getElementById('tagLanguage').value = savedLang;
+                
+                const imgs = parseImages(p.image_path);
+                mediaItems = imgs.map((img, idx) => ({
+                    type: 'existing', val: img, url: '/images/' + img, isCover: idx === 0 
+                }));
+                renderMediaPreviews();
+
+                document.getElementById('promptModal').classList.remove('hidden');
+            }
+
+            // HIER NEU: Die Funktion, um das Modal im Forking-Modus zu öffnen
+            function forkPrompt(id) {
+                const p = globalPrompts.find(x => x.id === id);
+                if(!p) return;
+                
+                document.getElementById('modalTitle').innerText = 'Fork Prompt';
+                document.getElementById('editPromptId').value = ''; // New Prompt, so NO Edit ID
+                document.getElementById('formForkedFrom').value = p.id; // Store parent ID
+                
+                document.getElementById('formTitle').value = "Fork of " + p.title;
+                document.getElementById('formAuthor').value = p.author;
+                document.getElementById('formTags').value = p.tags;
+                document.getElementById('formPrompt').value = p.prompt;
+                document.getElementById('is_shared').checked = false; // Forks default to private
+                document.getElementById('is_shared').disabled = false;
+                
+                const savedLang = localStorage.getItem('nanobananaTagLanguage');
+                if(savedLang) document.getElementById('tagLanguage').value = savedLang;
+                
+                // Copy existing images to the new fork
+                const imgs = parseImages(p.image_path);
+                mediaItems = imgs.map((img, idx) => ({
+                    type: 'existing', val: img, url: '/images/' + img, isCover: idx === 0 
+                }));
+                renderMediaPreviews();
+
+                document.getElementById('promptModal').classList.remove('hidden');
+            }
+            
+            async function openHistoryModal(id) {
+                const res = await fetch(`/api/prompts/${id}/history`);
+                const history = await res.json();
+                const container = document.getElementById('historyContainer');
+                container.innerHTML = '';
+                
+                if (history.length === 0) {
+                    container.innerHTML = '<p class="text-gray-400 italic text-center py-8">No previous versions exist for this prompt yet.</p>';
+                } else {
+                    history.forEach((h, index) => {
+                        const safeTitle = escapeHTML(h.title);
+                        const safeAuthor = escapeHTML(h.author);
+                        const safeTags = escapeHTML(h.tags);
+                        const safePrompt = escapeHTML(h.prompt);
+                        const safeEditor = escapeHTML(h.edited_by);
+                        const date = new Date(h.edited_at + 'Z').toLocaleString();
+                        
+                        const imgs = parseImages(h.image_path);
+                        const coverImg = imgs.length > 0 ? imgs[0] : '';
+                        
+                        const hasPlaceholders = /\\[(.*?)\\]/.test(h.prompt);
+                        let historyCopyBtn = '';
+                        if(hasPlaceholders) {
+                            historyCopyBtn = `<button onclick="openTemplateModal('${h.prompt_id}', decodeURIComponent('${encodeForJS(h.prompt)}'))" class="bg-blue-700 hover:bg-blue-600 text-xs px-3 py-1 rounded font-bold transition-colors border border-blue-600">🧩 Fill Old</button>`;
+                        } else {
+                            historyCopyBtn = `<button onclick="copyToClipboard(this, decodeURIComponent('${encodeForJS(h.prompt)}'), null)" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded font-bold transition-colors">📋 Copy Old</button>`;
+                        }
+                        
+                        container.innerHTML += `
+                            <div class="bg-gray-900 rounded p-4 border border-gray-700">
+                                <div class="flex justify-between items-center mb-2 border-b border-gray-700 pb-2">
+                                    <span class="text-xs font-bold text-yellow-500">Version ${history.length - index}</span>
+                                    <span class="text-xs text-gray-400">Changed by: <span class="text-white">${safeEditor}</span> on ${date}</span>
+                                </div>
+                                <div class="flex gap-4">
+                                    <img src="/images/${coverImg}" onclick="openLightbox('/images/${coverImg}')" class="w-24 h-24 object-cover rounded border border-gray-700 flex-shrink-0 bg-gray-800 cursor-zoom-in">
+                                    <div class="flex-grow min-w-0">
+                                        <h4 class="font-bold text-white mb-1 truncate">${safeTitle}</h4>
+                                        <p class="text-xs text-gray-400 mb-2 truncate">Author: ${safeAuthor} | Tags: ${safeTags}</p>
+                                        <div class="bg-gray-800 p-2 rounded text-xs text-gray-300 font-mono mb-2 break-words max-h-32 overflow-y-auto">
+                                            ${safePrompt}
+                                        </div>
+                                        ${historyCopyBtn}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+                document.getElementById('historyModal').classList.remove('hidden');
+            }
+
+            function openAuthorsModal() {
+                const authorCounts = {};
+                globalPrompts.forEach(p => {
+                    const a = p.author.trim();
+                    if(a) { authorCounts[a] = (authorCounts[a] || 0) + 1; }
+                });
+                
+                const sortedAuthors = Object.keys(authorCounts).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+                const container = document.getElementById('authorsContainer');
+                
+                container.innerHTML = sortedAuthors.map(author => {
+                    const safeAuthor = escapeHTML(author);
+                    return `
+                        <button onclick="triggerSearch(decodeURIComponent('author:${encodeForJS(author)}')); closeModal('authorsModal')" 
+                                class="bg-gray-700 hover:bg-yellow-500 hover:text-black text-white px-3 py-2 rounded transition-colors text-sm flex items-center gap-2">
+                            ${safeAuthor} 
+                            <span class="bg-gray-900 text-gray-400 text-xs px-2 py-0.5 rounded-full">${authorCounts[author]}</span>
+                        </button>
+                    `;
+                }).join('');
+                
+                if(sortedAuthors.length === 0) container.innerHTML = '<p class="text-gray-400 italic">No authors found.</p>';
+                document.getElementById('authorsModal').classList.remove('hidden');
+            }
+
+            function openTagsModal() {
+                const tagCounts = {};
+                globalPrompts.forEach(p => {
+                    if (p.tags) {
+                        p.tags.split(',').forEach(t => {
+                            const clean = t.trim();
+                            if(clean) tagCounts[clean] = (tagCounts[clean] || 0) + 1;
+                        });
+                    }
+                });
+                
+                const sortedTags = Object.keys(tagCounts).sort((a, b) => tagCounts[b] - tagCounts[a]);
+                const container = document.getElementById('tagsContainer');
+                
+                document.getElementById('mergeOldTag').value = '';
+                document.getElementById('mergeNewTag').value = '';
+                
+                container.innerHTML = sortedTags.map(tag => {
+                    const safeTag = escapeHTML(tag);
+                    return `
+                        <button onclick="triggerSearch(decodeURIComponent('tag:${encodeForJS(tag)}')); closeModal('tagsModal')" 
+                                class="bg-gray-700 hover:bg-yellow-500 hover:text-black text-white px-3 py-2 rounded transition-colors text-sm flex items-center gap-2">
+                            ${safeTag} 
+                            <span class="bg-gray-900 text-gray-400 text-xs px-2 py-0.5 rounded-full">${tagCounts[tag]}</span>
+                        </button>
+                    `;
+                }).join('');
+                
+                if(sortedTags.length === 0) container.innerHTML = '<p class="text-gray-400 italic">No tags found.</p>';
+                document.getElementById('tagsModal').classList.remove('hidden');
+            }
+
+            async function mergeTags() {
+                const oldTag = document.getElementById('mergeOldTag').value.trim();
+                const newTag = document.getElementById('mergeNewTag').value.trim();
+                
+                if(!oldTag || !newTag) { alert("Please provide both an old and a new tag name."); return; }
+                if(!confirm(`Are you sure you want to merge '${oldTag}' into '${newTag}'?`)) return;
+
+                const btn = document.getElementById('mergeTagBtn');
+                btn.innerText = 'Merging...'; btn.disabled = true;
+
+                const formData = new FormData();
+                formData.append('old_tag', oldTag);
+                formData.append('new_tag', newTag);
+
+                try {
+                    const res = await fetch('/api/tags/merge', { method: 'POST', body: formData });
+                    if(res.ok) {
+                        document.getElementById('mergeOldTag').value = '';
+                        document.getElementById('mergeNewTag').value = '';
+                        closeModal('tagsModal');
+                        fetchPrompts();
+                    } else {
+                        const error = await res.json();
+                        alert("Error: " + error.detail);
+                    }
+                } catch(e) { alert("Merge failed."); }
+                btn.innerText = 'Merge'; btn.disabled = false;
+            }
+
+            function closeModal(modalId) {
+                document.getElementById(modalId).classList.add('hidden');
+            }
+
+            async function submitForm(e) {
+                e.preventDefault();
+                if (mediaItems.length === 0) { alert('Please add at least one image.'); return; }
+                
+                const saveBtn = document.getElementById('saveButton');
+                saveBtn.innerText = 'Saving...';
+                saveBtn.disabled = true;
+
+                const formData = new FormData(e.target);
+                const isSharedCheckbox = document.getElementById('is_shared');
+                if(!formData.has('is_shared')) formData.append('is_shared', isSharedCheckbox.checked ? 'true' : 'false');
+                
+                const mediaOrder = [];
+                let newFileCounter = 0;
+                
+                mediaItems.forEach(item => {
+                    if (item.type === 'existing') {
+                        mediaOrder.push('existing:' + item.val);
+                    } else if (item.type === 'new') {
+                        mediaOrder.push('new:' + newFileCounter);
+                        formData.append('new_images', item.val);
+                        newFileCounter++;
+                    }
+                });
+                formData.append('media_order', JSON.stringify(mediaOrder));
+
+                const editId = document.getElementById('editPromptId').value;
+                const url = editId ? `/api/prompts/${editId}` : '/api/prompts';
+                const method = editId ? 'PUT' : 'POST';
+
+                try {
+                    const res = await fetch(url, { method: method, body: formData });
+                    if (!res.ok) {
+                        const error = await res.json();
+                        alert("Error: " + error.detail);
+                    } else {
+                        closeModal('promptModal');
+                        fetchPrompts();
+                    }
+                } catch(err) { alert("Upload failed."); }
+                
+                saveBtn.innerText = 'Save';
+                saveBtn.disabled = false;
+            }
+
+            async function deletePrompt(id) {
+                if(!confirm("Are you sure you want to permanently delete this prompt and all its history?")) return;
+                const res = await fetch(`/api/prompts/${id}`, { method: 'DELETE' });
+                if(res.ok) fetchPrompts();
+            }
+
+            function copyToClipboard(btn, text, promptId) {
+                executeCopyFinal(btn, text, promptId);
+            }
+
+            let initialCols = localStorage.getItem('nanobananaLayoutCols');
+            if (!initialCols) initialCols = window.innerWidth < 768 ? 1 : 3;
+            else initialCols = parseInt(initialCols);
+            setLayout(initialCols);
+            fetchPrompts(); 
+        </script>
+    </body>
+    </html>
+    """
+    return html_template.replace("__USER_EMAIL__", user.get('email', 'User'))
