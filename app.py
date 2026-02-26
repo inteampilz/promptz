@@ -532,7 +532,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
             """
             try:
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemma-3-27b-it',
                     contents=instruction
                 )
                 new_tags_raw = response.text.strip().replace('\n', '').replace('"', '')
@@ -625,7 +625,7 @@ async def auto_generate_tags(request: Request, prompt: str = Form(...), language
         """
         
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemma-3-27b-it',
             contents=instruction
         )
         tags = response.text.strip().replace('\n', '').replace('"', '')
@@ -648,7 +648,7 @@ async def auto_generate_title(request: Request, prompt: str = Form(...), languag
         Prompt: {prompt}
         """
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemma-3-27b-it',
             contents=instruction
         )
         title = response.text.strip().replace('\n', '').replace('"', '')
