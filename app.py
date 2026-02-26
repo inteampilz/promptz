@@ -71,6 +71,11 @@ def init_db():
                  (token TEXT PRIMARY KEY, prompt_id TEXT, created_by TEXT,
                   expires_at TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
+    c.execute("PRAGMA table_info(share_links)")
+    sl_cols = [col[1] for col in c.fetchall()]
+    if 'created_at' not in sl_cols:
+        c.execute("ALTER TABLE share_links ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
     conn.commit()
     conn.close()
 
@@ -222,10 +227,13 @@ async def create_share_link(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
     try:
         expires_in_hours = int(body.get("expires_in_hours", 24))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         raise HTTPException(status_code=400, detail="Invalid expires_in_hours.")
     if not (1 <= expires_in_hours <= 720):
         raise HTTPException(status_code=400, detail="expires_in_hours must be 1–720.")
@@ -2284,8 +2292,13 @@ def get_html(request: Request):
 
             async function loadShareLinks(promptId) {
                 const res = await fetch(`/api/prompts/${promptId}/share-links`);
-                const links = await res.json();
                 const container = document.getElementById('shareLinkList');
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    container.innerHTML = `<p class="text-xs text-red-400 italic">Error loading links: ${err.detail || res.status}</p>`;
+                    return;
+                }
+                const links = await res.json();
                 if (links.length === 0) {
                     container.innerHTML = '<p class="text-xs text-gray-500 italic">No active links yet.</p>';
                     return;
@@ -2312,7 +2325,11 @@ def get_html(request: Request):
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({expires_in_hours: hours})
                 });
-                if (!res.ok) { alert('Failed to create link.'); return; }
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Failed to create link: ' + (err.detail || res.status));
+                    return;
+                }
                 const data = await res.json();
                 const url = window.location.origin + '/share/' + data.token;
                 document.getElementById('shareLinkUrl').value = url;
