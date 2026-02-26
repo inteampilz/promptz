@@ -1903,16 +1903,16 @@ def get_html(request: Request):
 
                     const tooltipPrompt = safePrompt.replace(/"/g, '&quot;');
                     const copyCount = p.copy_count || 0;
-                    
+
                     const images = parseImages(p.image_path);
                     const isMulti = images.length > 1;
-                    
+
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach(img => {
-                        carouselHtml += `<img src="/images/${img}" onclick="if(!isBulkMode) openLightbox('/images/${img}')" loading="lazy" class="snap-center min-w-full h-full object-cover bg-gray-900 ${isBulkMode ? 'cursor-pointer' : 'cursor-zoom-in'}" title="${tooltipPrompt}">`;
+                        carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full object-cover bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
-                    
+
                     if (isMulti) {
                         carouselHtml += `
                             <button onclick="event.stopPropagation(); scrollCarousel('${p.id}', -1)" class="absolute left-2 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black text-white w-8 h-8 rounded-full flex items-center justify-center opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none">◀</button>
@@ -1920,6 +1920,10 @@ def get_html(request: Request):
                             <div id="carousel-counter-${p.id}" class="absolute bottom-2 right-2 bg-black/70 text-[10px] px-2 py-0.5 rounded text-white z-10 pointer-events-none transition-opacity">1 / ${images.length} 📸</div>
                         `;
                     }
+
+                    // Lightbox zoom button (visible on hover)
+                    const firstImg = images.length > 0 ? images[0] : '';
+                    carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('/images/${firstImg}')" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
                     
                     const favIcon = p.is_favorite ? '❤️' : '🤍';
                     
@@ -1965,11 +1969,11 @@ def get_html(request: Request):
                         <div class="bg-gray-800 rounded-lg overflow-hidden border ${selectedPrompts.has(p.id) ? 'border-purple-500' : 'border-gray-700'} shadow-lg flex flex-col relative group transition-colors" id="card-${p.id}">
                             ${badge}
                             ${bulkCheckboxHtml}
-                            
-                            <div class="relative w-full aspect-square group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); }">
+
+                            <div class="relative w-full aspect-square group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); } else { toggleCardDetails('${p.id}'); }">
                                 ${carouselHtml}
                             </div>
-                            
+
                             <div class="p-3 sm:p-4 flex flex-col flex-grow">
                                 ${forkBadge}
                                 <div class="flex justify-between items-start mb-1 gap-2">
@@ -1981,16 +1985,17 @@ def get_html(request: Request):
                                         </div>
                                     </div>
                                 </div>
-                                
-                                <p class="text-xs sm:text-sm text-gray-400 mb-2 sm:mb-3 truncate">
-                                    Author: <button onclick="triggerSearch(decodeURIComponent('author:${encodeForJS(p.author)}'))" class="hover:text-yellow-400 underline decoration-gray-600 hover:decoration-yellow-400 transition-colors cursor-pointer focus:outline-none">${safeAuthor}</button>
-                                </p>
-                                
-                                <div class="flex flex-wrap gap-1 mb-3 sm:mb-4 flex-grow content-start">${tagsHtml}</div>
-                                
-                                <div class="collection-badge-wrapper">${renderCollectionBadgesHtml(p)}</div>
+
+                                <div id="card-details-${p.id}" class="hidden">
+                                    <p class="text-xs sm:text-sm text-gray-400 mb-2 sm:mb-3 truncate">
+                                        Author: <button onclick="triggerSearch(decodeURIComponent('author:${encodeForJS(p.author)}'))" class="hover:text-yellow-400 underline decoration-gray-600 hover:decoration-yellow-400 transition-colors cursor-pointer focus:outline-none">${safeAuthor}</button>
+                                    </p>
+                                    <div class="flex flex-wrap gap-1 mb-3 sm:mb-4 content-start">${tagsHtml}</div>
+                                    <div class="collection-badge-wrapper mb-2">${renderCollectionBadgesHtml(p)}</div>
+                                    ${actionButtons}
+                                </div>
+
                                 ${mainCopyBtn}
-                                ${actionButtons}
                             </div>
                         </div>
                     `;
@@ -2055,6 +2060,11 @@ def get_html(request: Request):
             }
 
             // HIER NEU: Die Funktion, um das Modal im Forking-Modus zu öffnen
+            function toggleCardDetails(id) {
+                const details = document.getElementById('card-details-' + id);
+                if (details) details.classList.toggle('hidden');
+            }
+
             function forkPrompt(id) {
                 const p = globalPrompts.find(x => x.id === id);
                 if(!p) return;
