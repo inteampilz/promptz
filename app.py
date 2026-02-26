@@ -56,7 +56,15 @@ def init_db():
                   
     c.execute('''CREATE TABLE IF NOT EXISTS favorites
                  (user_email TEXT, prompt_id TEXT, UNIQUE(user_email, prompt_id))''')
-                 
+
+    c.execute('''CREATE TABLE IF NOT EXISTS collections
+                 (id TEXT PRIMARY KEY, name TEXT, user_email TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS collection_prompts
+                 (collection_id TEXT, prompt_id TEXT,
+                  UNIQUE(collection_id, prompt_id))''')
+
     conn.commit()
     conn.close()
 
@@ -133,22 +141,28 @@ def get_prompts(request: Request):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    # Left join to grab the title of the parent prompt if it was forked
+    # Left join to grab the title of the parent prompt if it was forked, and collection_ids for this user
     c.execute("""
         SELECT p.*, CASE WHEN f.prompt_id IS NOT NULL THEN 1 ELSE 0 END as is_favorite,
-               parent.title as forked_from_title
-        FROM prompts p 
+               parent.title as forked_from_title,
+               GROUP_CONCAT(cp.collection_id) as collection_ids
+        FROM prompts p
         LEFT JOIN favorites f ON p.id = f.prompt_id AND f.user_email = ?
         LEFT JOIN prompts parent ON p.forked_from = parent.id
-        WHERE p.is_shared = 1 OR p.user_email = ? 
+        LEFT JOIN collection_prompts cp ON p.id = cp.prompt_id
+            AND cp.collection_id IN (SELECT id FROM collections WHERE user_email = ?)
+        WHERE p.is_shared = 1 OR p.user_email = ?
+        GROUP BY p.id
         ORDER BY p.rowid DESC
-    """, (user['email'], user['email']))
+    """, (user['email'], user['email'], user['email']))
     rows = [dict(row) for row in c.fetchall()]
     conn.close()
-    
+
     for row in rows:
         row['is_mine'] = (row['user_email'] == user['email'])
         row['is_favorite'] = bool(row['is_favorite'])
+        raw_cids = row.get('collection_ids')
+        row['collection_ids'] = raw_cids.split(',') if raw_cids else []
     return rows
 
 @app.get("/api/prompts/{prompt_id}/history")
@@ -487,6 +501,107 @@ async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = 
     conn.close()
     return {"status": "success"}
 
+# --- COLLECTIONS API ---
+@app.get("/api/collections")
+def get_collections(request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT col.id, col.name, col.created_at, COUNT(cp.prompt_id) as prompt_count
+        FROM collections col
+        LEFT JOIN collection_prompts cp ON col.id = cp.collection_id
+        WHERE col.user_email = ?
+        GROUP BY col.id
+        ORDER BY col.created_at ASC
+    """, (user['email'],))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+@app.post("/api/collections")
+async def create_collection(request: Request, name: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    name = name.strip()
+    if not name: raise HTTPException(status_code=400, detail="Name is required.")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    new_id = str(uuid.uuid4())
+    c.execute("INSERT INTO collections (id, name, user_email) VALUES (?, ?, ?)", (new_id, name, user['email']))
+    conn.commit()
+    conn.close()
+    return {"id": new_id, "name": name, "prompt_count": 0}
+
+@app.put("/api/collections/{collection_id}")
+async def rename_collection(collection_id: str, request: Request, name: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    name = name.strip()
+    if not name: raise HTTPException(status_code=400, detail="Name is required.")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM collections WHERE id = ?", (collection_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403)
+    c.execute("UPDATE collections SET name = ? WHERE id = ?", (name, collection_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.delete("/api/collections/{collection_id}")
+async def delete_collection(collection_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM collections WHERE id = ?", (collection_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403)
+    c.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+    c.execute("DELETE FROM collection_prompts WHERE collection_id = ?", (collection_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+@app.post("/api/collections/{collection_id}/prompts")
+async def add_to_collection(collection_id: str, request: Request, prompt_id: str = Form(...)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM collections WHERE id = ?", (collection_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403)
+    c.execute("INSERT OR IGNORE INTO collection_prompts (collection_id, prompt_id) VALUES (?, ?)", (collection_id, prompt_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.delete("/api/collections/{collection_id}/prompts/{prompt_id}")
+async def remove_from_collection(collection_id: str, prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM collections WHERE id = ?", (collection_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403)
+    c.execute("DELETE FROM collection_prompts WHERE collection_id = ? AND prompt_id = ?", (collection_id, prompt_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
 # --- EXPORT & IMPORT API ---
 @app.get("/api/export/{format}")
 def export_data(format: str, request: Request):
@@ -762,6 +877,7 @@ def get_html(request: Request):
                     <div class="flex gap-2">
                         <button onclick="openTagsModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">🏷️ Tags</button>
                         <button onclick="openAuthorsModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">👥 Authors</button>
+                        <button onclick="openCollectionsModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base">📁 Collections</button>
                         <button onclick="document.getElementById('exportModal').classList.remove('hidden')" class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-2 px-3 sm:px-4 rounded border border-gray-700 transition-colors text-sm md:text-base" title="Manage Data">💾 Data</button>
                     </div>
                     
@@ -773,6 +889,11 @@ def get_html(request: Request):
                         + Add Prompt
                     </button>
                 </div>
+            </div>
+
+            <div id="activeCollectionBanner" class="hidden mb-4 bg-teal-900/30 border border-teal-600 rounded-lg px-4 py-3 flex items-center justify-between">
+                <span class="text-teal-300 font-bold">📁 Filtering by collection: <span id="activeCollectionName" class="text-white"></span></span>
+                <button onclick="clearCollectionFilter()" class="text-teal-400 hover:text-white transition-colors font-bold text-lg leading-none">✕</button>
             </div>
 
             <div class="md:hidden text-center mb-4">
@@ -791,6 +912,7 @@ def get_html(request: Request):
                 <div class="font-bold text-white text-lg"><span id="bulkCount" class="text-purple-400 text-2xl">0</span> Prompts Selected</div>
                 <div class="flex gap-2">
                     <button onclick="bulkTag()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold transition-colors">🏷️ Add Tag</button>
+                    <button onclick="openBulkCollectionModal()" class="bg-teal-700 hover:bg-teal-600 text-white px-4 py-2 rounded font-bold transition-colors">📁 Collect</button>
                     <button onclick="bulkDelete()" class="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded font-bold transition-colors">🗑️ Delete</button>
                     <button onclick="toggleBulkMode()" class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded font-bold transition-colors ml-4">Cancel</button>
                 </div>
@@ -969,6 +1091,46 @@ def get_html(request: Request):
             </div>
         </div>
 
+        <div id="collectionsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-2xl font-bold">📁 Collections</h2>
+                    <button onclick="closeModal('collectionsModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <p class="text-xs text-gray-400 mb-4">Group prompts into folders for easier navigation. Collections are personal — only you can see them.</p>
+                <div class="flex gap-2 mb-6">
+                    <input type="text" id="newCollectionName" placeholder="New collection name..."
+                           class="flex-grow p-2 rounded bg-gray-700 border border-gray-600 text-white focus:outline-none focus:border-teal-400"
+                           onkeydown="if(event.key==='Enter') createCollection()">
+                    <button onclick="createCollection()" class="bg-teal-600 hover:bg-teal-500 text-white font-bold py-2 px-4 rounded transition-colors">Create</button>
+                </div>
+                <div id="collectionsListContainer" class="flex flex-col gap-2"></div>
+            </div>
+        </div>
+
+        <div id="collectionAssignModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-[60]">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-sm max-h-[80vh] overflow-y-auto flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold">📁 Add to Collection</h2>
+                    <button onclick="closeModal('collectionAssignModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <input type="hidden" id="assignPromptId">
+                <div id="collectionAssignList" class="flex flex-col gap-2 mb-4"></div>
+                <p class="text-xs text-gray-500 text-center">Changes save immediately. Create collections via 📁 Collections.</p>
+            </div>
+        </div>
+
+        <div id="bulkCollectionModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-[60]">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-sm flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold">📁 Add to Collection</h2>
+                    <button onclick="closeModal('bulkCollectionModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <p class="text-sm text-gray-400 mb-4">Choose a collection to add <span id="bulkCollectCount" class="text-purple-400 font-bold">0</span> selected prompts to:</p>
+                <div id="bulkCollectionList" class="flex flex-col gap-2"></div>
+            </div>
+        </div>
+
         <script>
             let globalPrompts = [];
             let displayPrompts = [];
@@ -983,6 +1145,9 @@ def get_html(request: Request):
             
             let isBulkMode = false;
             let selectedPrompts = new Set();
+
+            let collections = [];
+            let activeCollectionId = null;
 
             function escapeHTML(str) {
                 if (!str) return '';
@@ -1569,11 +1734,14 @@ def get_html(request: Request):
             }
 
             async function fetchPrompts() {
-                const res = await fetch('/api/prompts');
-                if (res.status === 401) window.location.reload();
-                globalPrompts = await res.json();
-                
-                extractAutocompleteData(); 
+                const [promptsRes] = await Promise.all([
+                    fetch('/api/prompts'),
+                    fetchCollections()
+                ]);
+                if (promptsRes.status === 401) window.location.reload();
+                globalPrompts = await promptsRes.json();
+
+                extractAutocompleteData();
                 triggerRenderReset();
             }
 
@@ -1586,6 +1754,7 @@ def get_html(request: Request):
 
                 displayPrompts = globalPrompts.filter(p => {
                     if(showOnlyFavorites && !p.is_favorite) return false;
+                    if(activeCollectionId && !(p.collection_ids || []).includes(activeCollectionId)) return false;
                     if(terms.length === 0) return true;
 
                     let matchesAll = true;
@@ -1631,7 +1800,9 @@ def get_html(request: Request):
                     displayPrompts.sort((a, b) => (a.copy_count || 0) - (b.copy_count || 0));
                 }
 
-                document.getElementById('promptCounter').innerText = displayPrompts.length + " Prompts";
+                const activeCol = activeCollectionId ? collections.find(c => c.id === activeCollectionId) : null;
+                const counterLabel = activeCol ? ` Prompts in 📁 ${activeCol.name}` : ' Prompts';
+                document.getElementById('promptCounter').innerText = displayPrompts.length + counterLabel;
 
                 document.getElementById('gallery').innerHTML = '';
                 renderIndex = 0;
@@ -1684,6 +1855,7 @@ def get_html(request: Request):
                             <button onclick="forkPrompt('${p.id}')" class="flex-1 bg-purple-900 hover:bg-purple-800 text-purple-200 py-1 px-2 rounded text-sm transition-colors border border-purple-800" title="Copy as new prompt">🍴 Fork</button>
                             <button onclick="openEditModal('${p.id}')" class="flex-1 bg-blue-900 hover:bg-blue-800 text-blue-200 py-1 px-2 rounded text-sm transition-colors border border-blue-800">Edit</button>
                             <button onclick="openHistoryModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600">History</button>
+                            <button onclick="openCollectionAssignModal('${p.id}')" class="flex-1 bg-teal-900 hover:bg-teal-800 text-teal-200 py-1 px-2 rounded text-sm transition-colors border border-teal-800" title="Add to Collection">📁 Collect</button>
                             ${deleteBtn}
                         </div>
                     `;
@@ -1775,6 +1947,7 @@ def get_html(request: Request):
                                 
                                 <div class="flex flex-wrap gap-1 mb-3 sm:mb-4 flex-grow content-start">${tagsHtml}</div>
                                 
+                                <div class="collection-badge-wrapper">${renderCollectionBadgesHtml(p)}</div>
                                 ${mainCopyBtn}
                                 ${actionButtons}
                             </div>
@@ -2066,11 +2239,217 @@ def get_html(request: Request):
                 executeCopyFinal(btn, text, promptId);
             }
 
+            // --- COLLECTIONS LOGIC ---
+            function renderCollectionBadgesHtml(p) {
+                if (!p.collection_ids || p.collection_ids.length === 0) return '';
+                const badges = p.collection_ids.map(cid => {
+                    const col = collections.find(c => c.id === cid);
+                    if (!col) return '';
+                    return `<span class="bg-teal-900/60 text-teal-300 text-xs px-2 py-0.5 rounded-full cursor-pointer hover:bg-teal-800 transition-colors border border-teal-700" onclick="setActiveCollection('${cid}')">📁 ${escapeHTML(col.name)}</span>`;
+                }).filter(Boolean);
+                if (badges.length === 0) return '';
+                return `<div class="flex flex-wrap gap-1 mb-2">${badges.join('')}</div>`;
+            }
+
+            async function fetchCollections() {
+                try {
+                    const res = await fetch('/api/collections');
+                    if (res.ok) collections = await res.json();
+                } catch(e) {}
+            }
+
+            function openCollectionsModal() {
+                renderCollectionsList();
+                document.getElementById('newCollectionName').value = '';
+                document.getElementById('collectionsModal').classList.remove('hidden');
+            }
+
+            function renderCollectionsList() {
+                const container = document.getElementById('collectionsListContainer');
+                if (collections.length === 0) {
+                    container.innerHTML = '<p class="text-gray-400 italic text-center py-6">No collections yet. Create one above!</p>';
+                    return;
+                }
+                container.innerHTML = collections.map(col => {
+                    const safeName = escapeHTML(col.name);
+                    const isActive = activeCollectionId === col.id;
+                    return `
+                        <div class="flex items-center gap-2 p-3 bg-gray-700 rounded border ${isActive ? 'border-teal-500' : 'border-gray-600'} group">
+                            <button onclick="setActiveCollection('${col.id}')" class="flex-grow text-left font-medium hover:text-teal-300 transition-colors flex items-center gap-2 min-w-0">
+                                <span class="text-lg">📁</span>
+                                <span class="truncate">${safeName}</span>
+                                <span class="text-xs text-gray-400 ml-2 flex-shrink-0">${col.prompt_count} prompts</span>
+                                ${isActive ? '<span class="text-xs bg-teal-600 text-white px-2 py-0.5 rounded-full font-bold ml-1 flex-shrink-0">Active</span>' : ''}
+                            </button>
+                            <button onclick="startRenameCollection('${col.id}', decodeURIComponent('${encodeForJS(col.name)}'))" class="text-gray-400 hover:text-blue-400 transition-colors text-sm opacity-0 group-hover:opacity-100 flex-shrink-0 px-1" title="Rename">✏️</button>
+                            <button onclick="deleteCollection('${col.id}')" class="text-gray-400 hover:text-red-400 transition-colors text-sm opacity-0 group-hover:opacity-100 flex-shrink-0 px-1" title="Delete">🗑️</button>
+                        </div>
+                    `;
+                }).join('');
+            }
+
+            async function createCollection() {
+                const input = document.getElementById('newCollectionName');
+                const name = input.value.trim();
+                if (!name) return;
+                const formData = new FormData();
+                formData.append('name', name);
+                try {
+                    const res = await fetch('/api/collections', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const col = await res.json();
+                        collections.push(col);
+                        input.value = '';
+                        renderCollectionsList();
+                    }
+                } catch(e) { alert("Failed to create collection."); }
+            }
+
+            async function deleteCollection(id) {
+                if (!confirm("Delete this collection? Prompts will not be deleted.")) return;
+                try {
+                    const res = await fetch(`/api/collections/${id}`, { method: 'DELETE' });
+                    if (res.ok) {
+                        collections = collections.filter(c => c.id !== id);
+                        if (activeCollectionId === id) clearCollectionFilter();
+                        globalPrompts.forEach(p => {
+                            p.collection_ids = (p.collection_ids || []).filter(cid => cid !== id);
+                        });
+                        renderCollectionsList();
+                        triggerRenderReset();
+                    }
+                } catch(e) { alert("Failed to delete collection."); }
+            }
+
+            async function startRenameCollection(id, currentName) {
+                const newName = prompt("Rename collection:", currentName);
+                if (!newName || newName.trim() === currentName) return;
+                const formData = new FormData();
+                formData.append('name', newName.trim());
+                try {
+                    const res = await fetch(`/api/collections/${id}`, { method: 'PUT', body: formData });
+                    if (res.ok) {
+                        const col = collections.find(c => c.id === id);
+                        if (col) col.name = newName.trim();
+                        renderCollectionsList();
+                        if (activeCollectionId === id) {
+                            document.getElementById('activeCollectionName').innerText = newName.trim();
+                        }
+                        triggerRenderReset();
+                    }
+                } catch(e) { alert("Failed to rename collection."); }
+            }
+
+            function setActiveCollection(id) {
+                activeCollectionId = id;
+                const col = collections.find(c => c.id === id);
+                if (col) {
+                    document.getElementById('activeCollectionName').innerText = col.name;
+                    document.getElementById('activeCollectionBanner').classList.remove('hidden');
+                }
+                closeModal('collectionsModal');
+                triggerRenderReset();
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+
+            function clearCollectionFilter() {
+                activeCollectionId = null;
+                document.getElementById('activeCollectionBanner').classList.add('hidden');
+                triggerRenderReset();
+            }
+
+            function openCollectionAssignModal(promptId) {
+                document.getElementById('assignPromptId').value = promptId;
+                const p = globalPrompts.find(x => x.id === promptId);
+                const currentCollectionIds = p ? (p.collection_ids || []) : [];
+                const container = document.getElementById('collectionAssignList');
+                if (collections.length === 0) {
+                    container.innerHTML = '<p class="text-gray-400 italic text-center py-4">No collections yet. Create one via 📁 Collections in the toolbar.</p>';
+                } else {
+                    container.innerHTML = collections.map(col => {
+                        const safeName = escapeHTML(col.name);
+                        const isChecked = currentCollectionIds.includes(col.id);
+                        return `
+                            <label class="flex items-center gap-3 p-3 bg-gray-700 rounded border border-gray-600 cursor-pointer hover:border-teal-500 transition-colors">
+                                <input type="checkbox" class="w-4 h-4 rounded accent-teal-500 flex-shrink-0"
+                                       ${isChecked ? 'checked' : ''}
+                                       onchange="togglePromptInCollection('${col.id}', '${promptId}', this.checked)">
+                                <span class="font-medium">📁 ${safeName}</span>
+                                <span class="text-xs text-gray-400 ml-auto">${col.prompt_count} prompts</span>
+                            </label>
+                        `;
+                    }).join('');
+                }
+                document.getElementById('collectionAssignModal').classList.remove('hidden');
+            }
+
+            async function togglePromptInCollection(collectionId, promptId, shouldAdd) {
+                try {
+                    let res;
+                    if (shouldAdd) {
+                        const formData = new FormData();
+                        formData.append('prompt_id', promptId);
+                        res = await fetch(`/api/collections/${collectionId}/prompts`, { method: 'POST', body: formData });
+                    } else {
+                        res = await fetch(`/api/collections/${collectionId}/prompts/${promptId}`, { method: 'DELETE' });
+                    }
+                    if (res.ok) {
+                        const p = globalPrompts.find(x => x.id === promptId);
+                        if (p) {
+                            if (shouldAdd && !p.collection_ids.includes(collectionId)) p.collection_ids.push(collectionId);
+                            else if (!shouldAdd) p.collection_ids = p.collection_ids.filter(id => id !== collectionId);
+                        }
+                        const col = collections.find(c => c.id === collectionId);
+                        if (col) col.prompt_count = Math.max(0, col.prompt_count + (shouldAdd ? 1 : -1));
+                        if (activeCollectionId === collectionId && !shouldAdd) triggerRenderReset();
+                        // Refresh badge on the card without full re-render
+                        const cardEl = document.getElementById('card-' + promptId);
+                        if (cardEl) {
+                            const badgeWrapper = cardEl.querySelector('.collection-badge-wrapper');
+                            if (badgeWrapper && p) badgeWrapper.innerHTML = renderCollectionBadgesHtml(p);
+                        }
+                    }
+                } catch(e) { alert("Failed to update collection."); }
+            }
+
+            function openBulkCollectionModal() {
+                if (selectedPrompts.size === 0) return alert("Please select at least one prompt.");
+                if (collections.length === 0) {
+                    alert("No collections exist yet. Create one via 📁 Collections in the toolbar.");
+                    return;
+                }
+                document.getElementById('bulkCollectCount').innerText = selectedPrompts.size;
+                const container = document.getElementById('bulkCollectionList');
+                container.innerHTML = collections.map(col => {
+                    const safeName = escapeHTML(col.name);
+                    return `<button onclick="bulkAddToCollection('${col.id}')" class="w-full text-left p-3 bg-gray-700 hover:bg-teal-700 rounded border border-gray-600 hover:border-teal-500 transition-colors flex items-center gap-2">📁 ${safeName} <span class="text-xs text-gray-400 ml-auto">${col.prompt_count} prompts</span></button>`;
+                }).join('');
+                document.getElementById('bulkCollectionModal').classList.remove('hidden');
+            }
+
+            async function bulkAddToCollection(collectionId) {
+                const ids = Array.from(selectedPrompts);
+                let added = 0;
+                for (const pid of ids) {
+                    const formData = new FormData();
+                    formData.append('prompt_id', pid);
+                    try {
+                        const res = await fetch(`/api/collections/${collectionId}/prompts`, { method: 'POST', body: formData });
+                        if (res.ok) added++;
+                    } catch(e) {}
+                }
+                closeModal('bulkCollectionModal');
+                const col = collections.find(c => c.id === collectionId);
+                if (col) col.prompt_count = Math.max(0, col.prompt_count + added);
+                toggleBulkMode();
+                fetchPrompts();
+            }
+
             let initialCols = localStorage.getItem('nanobananaLayoutCols');
             if (!initialCols) initialCols = window.innerWidth < 768 ? 1 : 3;
             else initialCols = parseInt(initialCols);
             setLayout(initialCols);
-            fetchPrompts(); 
+            fetchPrompts();
         </script>
     </body>
     </html>
