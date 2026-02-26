@@ -178,6 +178,42 @@ def get_prompt_history(prompt_id: str, request: Request):
     conn.close()
     return rows
 
+@app.post("/api/prompts/{prompt_id}/rollback/{history_id}")
+async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,))
+    current = c.fetchone()
+    if not current:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Prompt not found.")
+    if current['user_email'] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not the owner.")
+
+    c.execute("SELECT * FROM prompt_history WHERE history_id = ? AND prompt_id = ?", (history_id, prompt_id))
+    hist = c.fetchone()
+    if not hist:
+        conn.close()
+        raise HTTPException(status_code=404, detail="History entry not found.")
+
+    # Save current state to history before overwriting (so the rollback itself is undoable)
+    c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (str(uuid.uuid4()), prompt_id, current['title'], current['prompt'],
+               current['author'], current['tags'], current['image_path'], user['email']))
+
+    c.execute("""UPDATE prompts SET title = ?, prompt = ?, author = ?, tags = ?, image_path = ? WHERE id = ?""",
+              (hist['title'], hist['prompt'], hist['author'], hist['tags'], hist['image_path'], prompt_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
 @app.post("/api/prompts")
 async def add_prompt(request: Request):
     user = request.session.get('user')
@@ -2050,15 +2086,28 @@ def get_html(request: Request):
                 document.getElementById('promptModal').classList.remove('hidden');
             }
             
+            async function rollbackToVersion(promptId, historyId) {
+                if (!confirm('Rollback to this version? The current version will be saved to history first.')) return;
+                const res = await fetch(`/api/prompts/${promptId}/rollback/${historyId}`, { method: 'POST' });
+                if (res.ok) {
+                    closeModal('historyModal');
+                    await loadPrompts();
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Rollback failed: ' + (err.detail || res.status));
+                }
+            }
+
             async function openHistoryModal(id) {
                 const res = await fetch(`/api/prompts/${id}/history`);
                 const history = await res.json();
                 const container = document.getElementById('historyContainer');
                 container.innerHTML = '';
-                
+
                 if (history.length === 0) {
                     container.innerHTML = '<p class="text-gray-400 italic text-center py-8">No previous versions exist for this prompt yet.</p>';
                 } else {
+                    const isOwner = (globalPrompts.find(p => p.id === id) || {}).is_mine || false;
                     history.forEach((h, index) => {
                         const safeTitle = escapeHTML(h.title);
                         const safeAuthor = escapeHTML(h.author);
@@ -2066,10 +2115,10 @@ def get_html(request: Request):
                         const safePrompt = escapeHTML(h.prompt);
                         const safeEditor = escapeHTML(h.edited_by);
                         const date = new Date(h.edited_at + 'Z').toLocaleString();
-                        
+
                         const imgs = parseImages(h.image_path);
                         const coverImg = imgs.length > 0 ? imgs[0] : '';
-                        
+
                         const hasPlaceholders = /\\[(.*?)\\]/.test(h.prompt);
                         let historyCopyBtn = '';
                         if(hasPlaceholders) {
@@ -2077,7 +2126,10 @@ def get_html(request: Request):
                         } else {
                             historyCopyBtn = `<button onclick="copyToClipboard(this, decodeURIComponent('${encodeForJS(h.prompt)}'), null)" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded font-bold transition-colors">📋 Copy Old</button>`;
                         }
-                        
+                        const rollbackBtn = isOwner
+                            ? `<button onclick="rollbackToVersion('${h.prompt_id}', '${h.history_id}')" class="bg-orange-700 hover:bg-orange-600 text-xs px-3 py-1 rounded font-bold transition-colors border border-orange-600">↩ Rollback</button>`
+                            : '';
+
                         container.innerHTML += `
                             <div class="bg-gray-900 rounded p-4 border border-gray-700">
                                 <div class="flex justify-between items-center mb-2 border-b border-gray-700 pb-2">
@@ -2092,7 +2144,10 @@ def get_html(request: Request):
                                         <div class="bg-gray-800 p-2 rounded text-xs text-gray-300 font-mono mb-2 break-words max-h-32 overflow-y-auto">
                                             ${safePrompt}
                                         </div>
-                                        ${historyCopyBtn}
+                                        <div class="flex gap-2 flex-wrap">
+                                            ${historyCopyBtn}
+                                            ${rollbackBtn}
+                                        </div>
                                     </div>
                                 </div>
                             </div>
