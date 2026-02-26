@@ -897,9 +897,10 @@ def view_shared_prompt(token: str):
 
     safe_title  = html_mod.escape(prompt['title'] or '')
     safe_author = html_mod.escape(prompt['author'] or '')
-    safe_prompt = html_mod.escape(prompt['prompt'] or '')
     tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(t)}</span>' for t in tags)
     imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(img)}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
+    # Embed raw prompt as a JSON string so JS can handle placeholders safely
+    prompt_js   = json.dumps(prompt['prompt'] or '')
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
 <head>
@@ -918,13 +919,64 @@ def view_shared_prompt(token: str):
       <h2 class="text-2xl font-bold mb-1">{safe_title}</h2>
       <p class="text-sm text-gray-400 mb-3">by {safe_author}</p>
       <div class="flex flex-wrap gap-2 mb-4">{tags_html}</div>
-      <pre id="promptText" class="bg-gray-900 rounded p-4 text-sm text-gray-200 whitespace-pre-wrap break-words mb-4">{safe_prompt}</pre>
-      <button onclick="navigator.clipboard.writeText(document.getElementById('promptText').textContent).then(()=>{{this.textContent='✓ Copied!';setTimeout(()=>this.textContent='📋 Copy Prompt',1500)}})"
+      <div id="fillSection" class="hidden mb-4">
+        <p class="text-sm text-blue-400 font-medium mb-3">Fill in the placeholders:</p>
+        <div id="fillForm"></div>
+      </div>
+      <pre id="promptPreview" class="bg-gray-900 rounded p-4 text-sm text-gray-200 whitespace-pre-wrap break-words mb-4"></pre>
+      <button id="copyBtn" onclick="copyFilled()"
               class="w-full bg-gray-700 hover:bg-gray-600 py-2 rounded font-bold transition-colors">
         📋 Copy Prompt
       </button>
     </div>
   </div>
+  <script>
+    const PROMPT_TEXT = {prompt_js};
+    const HAS_PLACEHOLDERS = /\\[(.*?)\\]/.test(PROMPT_TEXT);
+
+    function escapeHTML(s) {{
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }}
+    function escapeRegExp(s) {{
+      return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+    }}
+    function updatePreview() {{
+      let text = PROMPT_TEXT;
+      document.querySelectorAll('.ph-input').forEach(inp => {{
+        const ph = inp.dataset.ph;
+        const val = inp.value || '[' + ph + ']';
+        text = text.replace(new RegExp('\\\\[' + escapeRegExp(ph) + '\\\\]', 'g'), val);
+      }});
+      document.getElementById('promptPreview').textContent = text;
+    }}
+    function copyFilled() {{
+      let text = PROMPT_TEXT;
+      document.querySelectorAll('.ph-input').forEach(inp => {{
+        const ph = inp.dataset.ph;
+        const val = inp.value || '[' + ph + ']';
+        text = text.replace(new RegExp('\\\\[' + escapeRegExp(ph) + '\\\\]', 'g'), val);
+      }});
+      const btn = document.getElementById('copyBtn');
+      navigator.clipboard.writeText(text).then(() => {{
+        btn.textContent = '✓ Copied!';
+        setTimeout(() => {{ btn.textContent = HAS_PLACEHOLDERS ? '🧩 Fill & Copy' : '📋 Copy Prompt'; }}, 1500);
+      }});
+    }}
+    if (HAS_PLACEHOLDERS) {{
+      const phs = [...new Set([...PROMPT_TEXT.matchAll(/\\[(.*?)\\]/g)].map(m => m[1]))];
+      const form = document.getElementById('fillForm');
+      phs.forEach(ph => {{
+        const d = document.createElement('div');
+        d.innerHTML = '<label class="block text-xs font-bold text-blue-400 mb-1 tracking-wider uppercase">' + escapeHTML(ph) + '</label>'
+          + '<input type="text" data-ph="' + escapeHTML(ph) + '" oninput="updatePreview()" '
+          + 'class="ph-input w-full p-2 rounded bg-gray-700 border border-gray-600 text-white mb-3 focus:outline-none focus:border-blue-400" placeholder="Type here...">';
+        form.appendChild(d);
+      }});
+      document.getElementById('fillSection').classList.remove('hidden');
+      document.getElementById('copyBtn').textContent = '🧩 Fill & Copy';
+    }}
+    updatePreview();
+  </script>
 </body></html>""")
 
 # --- FRONTEND ---
