@@ -16,6 +16,10 @@ from authlib.integrations.starlette_client import OAuth
 from PIL import Image
 from google import genai
 from google.genai import types
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import asyncio
 
 app = FastAPI()
 
@@ -34,6 +38,12 @@ DATA_DIR = "/app/data"
 IMG_DIR = f"{DATA_DIR}/images"
 DB_PATH = f"{DATA_DIR}/prompts.db"
 os.makedirs(IMG_DIR, exist_ok=True)
+
+SMTP_HOST     = os.getenv("SMTP_HOST", "")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM     = os.getenv("SMTP_FROM", "")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -76,10 +86,41 @@ def init_db():
     if 'created_at' not in sl_cols:
         c.execute("ALTER TABLE share_links ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
+    c.execute('''CREATE TABLE IF NOT EXISTS comments
+                 (id TEXT PRIMARY KEY, prompt_id TEXT, parent_id TEXT,
+                  author_email TEXT, author_name TEXT, body TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS comment_votes
+                 (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
+
     conn.commit()
     conn.close()
 
 init_db()
+
+def _send_email_sync(to: str, subject: str, body_html: str):
+    if not (SMTP_HOST and SMTP_FROM and to):
+        return
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = SMTP_FROM
+        msg['To'] = to
+        msg.attach(MIMEText(body_html, 'html'))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            if SMTP_PORT != 465:
+                server.starttls()
+            if SMTP_USER and SMTP_PASSWORD:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, to, msg.as_string())
+    except Exception:
+        pass  # Never let email errors break the API
+
+async def send_notification_email(to: str, subject: str, body_html: str):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _send_email_sync, to, subject, body_html)
 
 app.mount("/images", StaticFiles(directory=IMG_DIR, html=True), name="images")
 
@@ -614,16 +655,16 @@ async def auto_generate_tags(request: Request, prompt: str = Form(...), language
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     if not prompt: return {"tags": ""}
-    
+
     try:
-        client = genai.Client() 
+        client = genai.Client()
         instruction = f"""
         Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
         Output EXACTLY a comma-separated list of tags in lowercase. No markdown, no further explanations.
         The tags MUST be written in the following language: {language}.
         Prompt: {prompt}
         """
-        
+
         response = client.models.generate_content(
             model='gemma-3-27b-it',
             contents=instruction
@@ -638,15 +679,17 @@ async def auto_generate_title(request: Request, prompt: str = Form(...), languag
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     if not prompt: return {"title": ""}
-    
+
     try:
-        client = genai.Client() 
+        client = genai.Client()
         instruction = f"""
-        Analyze this prompt for AI image generation and create a short, catchy, and descriptive title (maximum 5 words).
-        Output EXACTLY the title and nothing else. No quotes, no markdown, no further explanations.
+        Create a short, descriptive title (3 to 8 words) for the following AI image generation prompt.
+        The title should capture the main subject and mood of the image.
+        Output ONLY the title text, nothing else. No quotes, no markdown, no explanation.
         The title MUST be written in the following language: {language}.
         Prompt: {prompt}
         """
+
         response = client.models.generate_content(
             model='gemma-3-27b-it',
             contents=instruction
@@ -655,6 +698,139 @@ async def auto_generate_title(request: Request, prompt: str = Form(...), languag
         return {"title": title}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/prompts/{prompt_id}/comments")
+async def get_comments(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.*,
+               COUNT(v.comment_id) as downvote_count,
+               MAX(CASE WHEN v.user_email = ? THEN 1 ELSE 0 END) as user_downvoted
+        FROM comments c
+        LEFT JOIN comment_votes v ON c.id = v.comment_id
+        WHERE c.prompt_id = ?
+        GROUP BY c.id
+        ORDER BY c.created_at ASC
+    """, (user['email'], prompt_id))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    top_level = [r for r in rows if not r['parent_id']]
+    replies_map = {}
+    for r in rows:
+        if r['parent_id']:
+            replies_map.setdefault(r['parent_id'], []).append(r)
+    for row in top_level:
+        row['replies'] = replies_map.get(row['id'], [])
+        row['is_mine'] = (row['author_email'] == user['email'])
+        row['user_downvoted'] = bool(row['user_downvoted'])
+        for reply in row['replies']:
+            reply['is_mine'] = (reply['author_email'] == user['email'])
+            reply['user_downvoted'] = bool(reply['user_downvoted'])
+            reply['replies'] = []
+    return top_level
+
+@app.post("/api/prompts/{prompt_id}/comments")
+async def add_comment(prompt_id: str, request: Request,
+                      body: str = Form(...), parent_id: Optional[str] = Form(None)):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    body = body.strip()
+    if not body: raise HTTPException(status_code=400, detail="Comment cannot be empty.")
+    parent_id = parent_id.strip() if parent_id else None
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT title, user_email FROM prompts WHERE id = ? AND (is_shared = 1 OR user_email = ?)",
+              (prompt_id, user['email']))
+    prompt_row = c.fetchone()
+    if not prompt_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Prompt not found.")
+
+    parent_row = None
+    if parent_id:
+        c.execute("SELECT author_email FROM comments WHERE id = ? AND prompt_id = ?", (parent_id, prompt_id))
+        parent_row = c.fetchone()
+        if not parent_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Parent comment not found.")
+
+    comment_id = str(uuid.uuid4())
+    author_name = user.get('name') or user.get('preferred_username') or user['email']
+    c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
+              (comment_id, prompt_id, parent_id, user['email'], author_name, body))
+    conn.commit()
+    conn.close()
+
+    prompt_title = prompt_row['title'] or 'Untitled'
+    commenter = author_name
+
+    if parent_row and parent_row['author_email'] != user['email']:
+        notify_to = parent_row['author_email']
+        subject = f'New reply to your comment on "{prompt_title}"'
+        html_body = (f'<p><b>{html_mod.escape(commenter)}</b> replied to your comment on '
+                     f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
+                     f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
+                     f'{html_mod.escape(body)}</blockquote>'
+                     f'<p>Log in to NanoBanana Prompts to view the full thread.</p>')
+        asyncio.create_task(send_notification_email(notify_to, subject, html_body))
+    elif not parent_id and prompt_row['user_email'] != user['email']:
+        notify_to = prompt_row['user_email']
+        subject = f'New comment on your prompt "{prompt_title}"'
+        html_body = (f'<p><b>{html_mod.escape(commenter)}</b> commented on your prompt '
+                     f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
+                     f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
+                     f'{html_mod.escape(body)}</blockquote>'
+                     f'<p>Log in to NanoBanana Prompts to view and reply.</p>')
+        asyncio.create_task(send_notification_email(notify_to, subject, html_body))
+
+    return {"status": "ok", "id": comment_id}
+
+@app.post("/api/comments/{comment_id}/downvote")
+async def toggle_downvote(comment_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM comment_votes WHERE comment_id = ? AND user_email = ?",
+              (comment_id, user['email']))
+    if c.fetchone():
+        c.execute("DELETE FROM comment_votes WHERE comment_id = ? AND user_email = ?",
+                  (comment_id, user['email']))
+        voted = False
+    else:
+        c.execute("INSERT INTO comment_votes (comment_id, user_email) VALUES (?, ?)",
+                  (comment_id, user['email']))
+        voted = True
+    conn.commit()
+    conn.close()
+    return {"downvoted": voted}
+
+@app.delete("/api/comments/{comment_id}")
+async def delete_comment(comment_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT author_email FROM comments WHERE id = ?", (comment_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Comment not found.")
+    if row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not your comment.")
+    c.execute("DELETE FROM comments WHERE id = ? OR parent_id = ?", (comment_id, comment_id))
+    c.execute("DELETE FROM comment_votes WHERE comment_id = ?", (comment_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
 
 @app.post("/api/tags/merge")
 async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = Form(...)):
@@ -1312,14 +1488,12 @@ def get_html(request: Request):
                     <input type="hidden" id="editPromptId" name="editPromptId" value="">
                     <input type="hidden" id="formForkedFrom" name="forked_from" value="">
                     
-                    <div class="flex justify-between items-end mb-1">
-                        <label class="text-sm font-medium text-gray-400">Title</label>
-                        <button type="button" onclick="autoGenerateTitle(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                    <div class="flex gap-2 mb-3">
+                        <input type="text" id="formTitle" name="title" placeholder="Title" required class="flex-grow p-2 rounded bg-gray-700 border border-gray-600 text-white">
+                        <button type="button" onclick="autoGenerateTitle(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-3 py-1 rounded transition-colors focus:outline-none whitespace-nowrap flex-shrink-0" title="Generate title from prompt text via Gemini">
                             ✨ Auto-Title
                         </button>
                     </div>
-                    <input type="text" id="formTitle" name="title" placeholder="Title" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white transition-colors">
-                    
                     <div class="relative w-full mb-3">
                         <input type="text" id="formAuthor" name="author" placeholder="Author/Creator" required autocomplete="off" oninput="showAuthorSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
                         <div id="authorSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
@@ -1488,6 +1662,26 @@ def get_html(request: Request):
                 <div>
                     <h3 class="text-sm font-bold text-gray-300 mb-2">Active links</h3>
                     <div id="shareLinkList" class="flex flex-col gap-2 max-h-48 overflow-y-auto"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="commentsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg flex flex-col gap-4" style="max-height:90vh">
+                <div class="flex justify-between items-center flex-shrink-0">
+                    <h2 class="text-xl font-bold">💬 Comments</h2>
+                    <button onclick="closeModal('commentsModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <div id="commentsList" class="flex flex-col gap-3 overflow-y-auto flex-grow min-h-0"></div>
+                <div class="border-t border-gray-700 pt-3 flex-shrink-0">
+                    <textarea id="newCommentBody" placeholder="Write a comment…" rows="3"
+                        class="w-full bg-gray-700 border border-gray-600 rounded p-2 text-sm text-white resize-none focus:outline-none focus:border-yellow-400 mb-2"></textarea>
+                    <div class="flex justify-end">
+                        <button onclick="submitComment()"
+                            class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold px-4 py-2 rounded text-sm transition-colors">
+                            Post Comment
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2132,8 +2326,186 @@ def get_html(request: Request):
                     alert("Failed to connect to Auto-Tag API."); 
                 }
                 
-                btn.innerText = originalText; 
+                btn.innerText = originalText;
                 btn.disabled = false;
+            }
+
+            async function autoGenerateTitle(btn) {
+                const promptField = document.getElementById('formPrompt');
+                const titleField = document.getElementById('formTitle');
+                const langField = document.getElementById('tagLanguage');
+
+                if (!promptField.value.trim()) {
+                    alert("Please enter or extract a prompt text first so Gemini knows what to title!");
+                    return;
+                }
+
+                const originalText = btn.innerText;
+                btn.innerText = '⏳ Generating...';
+                btn.disabled = true;
+
+                const formData = new FormData();
+                formData.append('prompt', promptField.value);
+                formData.append('language', langField.value);
+
+                try {
+                    const res = await fetch('/api/title/auto', { method: 'POST', body: formData });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.title) {
+                            titleField.value = data.title;
+                            titleField.classList.remove('flash-success');
+                            void titleField.offsetWidth;
+                            titleField.classList.add('flash-success');
+                        }
+                    } else {
+                        const err = await res.json();
+                        alert("Error generating title: " + err.detail);
+                    }
+                } catch (e) {
+                    alert("Failed to connect to Auto-Title API.");
+                }
+
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+
+            // ── Comments ──────────────────────────────────────────────────────
+
+            async function openCommentsModal(promptId) {
+                currentCommentPromptId = promptId;
+                document.getElementById('newCommentBody').value = '';
+                document.getElementById('commentsModal').classList.remove('hidden');
+                await loadComments(promptId);
+            }
+
+            async function loadComments(promptId) {
+                const container = document.getElementById('commentsList');
+                container.innerHTML = '<p class="text-xs text-gray-500 italic text-center py-4">Loading…</p>';
+                const res = await fetch(`/api/prompts/${promptId}/comments`);
+                if (!res.ok) {
+                    container.innerHTML = '<p class="text-xs text-red-400 text-center py-4">Failed to load comments.</p>';
+                    return;
+                }
+                const comments = await res.json();
+                if (comments.length === 0) {
+                    container.innerHTML = '<p class="text-xs text-gray-500 italic text-center py-4">No comments yet. Be the first!</p>';
+                    return;
+                }
+                container.innerHTML = comments.map(c => renderComment(c, false)).join('');
+            }
+
+            function renderComment(c, isReply) {
+                const safeBody   = escapeHTML(c.body);
+                const safeAuthor = escapeHTML(c.author_name || c.author_email);
+                const date       = new Date(c.created_at + 'Z').toLocaleString();
+                const dvClass    = c.user_downvoted
+                    ? 'text-red-400'
+                    : 'text-gray-500 hover:text-red-400';
+                const deleteBtn  = c.is_mine
+                    ? `<button onclick="deleteComment('${c.id}')" class="text-xs text-gray-600 hover:text-red-400 transition-colors" title="Delete">🗑</button>`
+                    : '';
+                const replyBtn   = isReply ? '' :
+                    `<button onclick="toggleReplyForm('${c.id}')" class="text-xs text-gray-500 hover:text-yellow-400 transition-colors">↩ Reply</button>`;
+                const replyForm  = isReply ? '' : `
+                    <div id="reply-form-${c.id}" class="hidden mt-2">
+                        <textarea id="reply-body-${c.id}" placeholder="Write a reply…" rows="2"
+                            class="w-full bg-gray-900 border border-gray-600 rounded p-2 text-xs text-white resize-none focus:outline-none focus:border-yellow-400 mb-1"></textarea>
+                        <div class="flex gap-2 justify-end">
+                            <button onclick="toggleReplyForm('${c.id}')" class="text-xs text-gray-400 hover:text-white px-2 py-1 rounded">Cancel</button>
+                            <button onclick="submitReply('${c.id}')" class="text-xs bg-yellow-500 hover:bg-yellow-600 text-black font-bold px-3 py-1 rounded transition-colors">Reply</button>
+                        </div>
+                    </div>`;
+                const repliesHtml = (c.replies && c.replies.length > 0)
+                    ? `<div class="ml-4 mt-2 flex flex-col gap-2 border-l-2 border-gray-700 pl-3">
+                           ${c.replies.map(r => renderComment(r, true)).join('')}
+                       </div>`
+                    : '';
+                const wrapClass = isReply ? '' : 'bg-gray-900 rounded-lg p-3';
+                return `
+                <div class="${wrapClass}">
+                    <div class="flex items-start justify-between gap-2">
+                        <div class="flex-grow min-w-0">
+                            <span class="text-xs font-bold text-yellow-400">${safeAuthor}</span>
+                            <span class="text-xs text-gray-500 ml-2">${date}</span>
+                            <p class="text-sm text-gray-200 mt-1 break-words">${safeBody}</p>
+                        </div>
+                        <div class="flex items-center gap-1 flex-shrink-0">
+                            <button onclick="downvoteComment('${c.id}', this)"
+                                class="text-xs ${dvClass} transition-colors flex items-center gap-0.5"
+                                title="Downvote" id="dv-btn-${c.id}">
+                                👎 <span id="dv-count-${c.id}">${c.downvote_count || 0}</span>
+                            </button>
+                            ${deleteBtn}
+                        </div>
+                    </div>
+                    <div class="flex gap-3 mt-1">${replyBtn}</div>
+                    ${replyForm}
+                    ${repliesHtml}
+                </div>`;
+            }
+
+            function toggleReplyForm(commentId) {
+                const form = document.getElementById('reply-form-' + commentId);
+                if (form) form.classList.toggle('hidden');
+            }
+
+            async function submitComment() {
+                const body = document.getElementById('newCommentBody').value.trim();
+                if (!body) return;
+                const formData = new FormData();
+                formData.append('body', body);
+                const res = await fetch(`/api/prompts/${currentCommentPromptId}/comments`,
+                    { method: 'POST', body: formData });
+                if (res.ok) {
+                    document.getElementById('newCommentBody').value = '';
+                    await loadComments(currentCommentPromptId);
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Failed to post comment: ' + (err.detail || res.status));
+                }
+            }
+
+            async function submitReply(parentId) {
+                const body = document.getElementById('reply-body-' + parentId).value.trim();
+                if (!body) return;
+                const formData = new FormData();
+                formData.append('body', body);
+                formData.append('parent_id', parentId);
+                const res = await fetch(`/api/prompts/${currentCommentPromptId}/comments`,
+                    { method: 'POST', body: formData });
+                if (res.ok) {
+                    await loadComments(currentCommentPromptId);
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Failed to post reply: ' + (err.detail || res.status));
+                }
+            }
+
+            async function downvoteComment(commentId, btn) {
+                const res = await fetch(`/api/comments/${commentId}/downvote`, { method: 'POST' });
+                if (!res.ok) return;
+                const data = await res.json();
+                const countEl = document.getElementById('dv-count-' + commentId);
+                if (countEl) {
+                    const cur = parseInt(countEl.textContent) || 0;
+                    countEl.textContent = data.downvoted ? cur + 1 : Math.max(0, cur - 1);
+                }
+                btn.className = btn.className
+                    .replace('text-red-400', '')
+                    .replace('text-gray-500 hover:text-red-400', '')
+                    .trim()
+                    + ' ' + (data.downvoted ? 'text-red-400' : 'text-gray-500 hover:text-red-400');
+            }
+
+            async function deleteComment(commentId) {
+                if (!confirm('Delete this comment and all its replies?')) return;
+                const res = await fetch(`/api/comments/${commentId}`, { method: 'DELETE' });
+                if (res.ok) {
+                    await loadComments(currentCommentPromptId);
+                } else {
+                    alert('Failed to delete comment.');
+                }
             }
 
             function updateCarouselCounter(id, total) {
@@ -2327,6 +2699,7 @@ def get_html(request: Request):
                             <button onclick="openHistoryModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600">History</button>
                             <button onclick="openCollectionAssignModal('${p.id}')" class="flex-1 bg-teal-900 hover:bg-teal-800 text-teal-200 py-1 px-2 rounded text-sm transition-colors border border-teal-800" title="Add to Collection">📁 Collect</button>
                             <button onclick="openShareModal('${p.id}')" class="flex-1 bg-yellow-800 hover:bg-yellow-700 text-yellow-200 py-1 px-2 rounded text-sm transition-colors border border-yellow-700" title="Share link">🔗 Share</button>
+                            <button onclick="openCommentsModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600" title="Comments">💬 Comments</button>
                             ${deleteBtn}
                         </div>
                     `;
@@ -2493,6 +2866,7 @@ def get_html(request: Request):
             }
 
             let currentSharePromptId = null;
+            let currentCommentPromptId = null;
 
             async function openShareModal(promptId) {
                 currentSharePromptId = promptId;
