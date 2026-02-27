@@ -11,6 +11,12 @@ services:
       - OIDC_CLIENT_SECRET=secret
       - OIDC_DISCOVERY_URL=https://your_domain.com/.well-known/openid-configuration
       - GEMINI_API_KEY=secret
+      # SMTP E-Mail Konfiguration (optional, für Kommentar-Benachrichtigungen)
+      - SMTP_HOST=smtp.example.com
+      - SMTP_PORT=587
+      - SMTP_USER=notifications@example.com
+      - SMTP_PASSWORD=secret
+      - SMTP_FROM=NanoBanana Prompts <notifications@example.com>
       # HIER ANPASSEN: Pfad zu dem Ordner, in dem deine app.py liegt
       - /opt/nanobananadev:/app/code
       # Das Volume für die SQLite Datenbank und Bilder
