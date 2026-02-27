@@ -98,7 +98,6 @@ def init_db():
 
 init_db()
 
-# Removed the async wrapper and simplified the email sender for BackgroundTasks
 def _send_email_sync(to: str, subject: str, body_html: str):
     if not (SMTP_HOST and SMTP_FROM and to):
         return
@@ -115,8 +114,8 @@ def _send_email_sync(to: str, subject: str, body_html: str):
             if SMTP_USER and SMTP_PASSWORD:
                 server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_FROM, to, msg.as_string())
-    except Exception:
-        pass  # Never let email errors break the API
+    except Exception as e:
+        print(f"SMTP Error: {e}")
 
 app.mount("/images", StaticFiles(directory=IMG_DIR, html=True), name="images")
 
@@ -186,6 +185,8 @@ def get_prompts(request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401, detail="Unauthorized")
     
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -201,12 +202,12 @@ def get_prompts(request: Request):
         WHERE p.is_shared = 1 OR p.user_email = ?
         GROUP BY p.id
         ORDER BY p.rowid DESC
-    """, (user['email'], user['email'], user['email']))
+    """, (user_email, user_email, user_email))
     rows = [dict(row) for row in c.fetchall()]
     conn.close()
 
     for row in rows:
-        row['is_mine'] = (row['user_email'] == user['email'])
+        row['is_mine'] = (row['user_email'] == user_email)
         row['is_favorite'] = bool(row['is_favorite'])
         raw_cids = row.get('collection_ids')
         row['collection_ids'] = str(raw_cids).split(',') if raw_cids else []
@@ -229,6 +230,7 @@ def get_prompt_history(prompt_id: str, request: Request):
 async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -249,7 +251,7 @@ async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
     c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
               (str(uuid.uuid4()), prompt_id, current['title'], current['prompt'],
-               current['author'], current['tags'], current['image_path'], user['email']))
+               current['author'], current['tags'], current['image_path'], user_email))
 
     c.execute("""UPDATE prompts SET title = ?, prompt = ?, author = ?, tags = ?, image_path = ? WHERE id = ?""",
               (hist['title'], hist['prompt'], hist['author'], hist['tags'], hist['image_path'], prompt_id))
@@ -261,6 +263,7 @@ async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
 async def create_share_link(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
 
     try:
         body = await request.json()
@@ -276,7 +279,7 @@ async def create_share_link(prompt_id: str, request: Request):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT id FROM prompts WHERE id = ? AND (user_email = ? OR is_shared = 1)", (prompt_id, user['email']))
+    c.execute("SELECT id FROM prompts WHERE id = ? AND (user_email = ? OR is_shared = 1)", (prompt_id, user_email))
     if not c.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Prompt not found.")
@@ -284,7 +287,7 @@ async def create_share_link(prompt_id: str, request: Request):
     token = str(uuid.uuid4())
     expires_at = (datetime.utcnow() + timedelta(hours=expires_in_hours)).strftime("%Y-%m-%d %H:%M:%S")
     c.execute("INSERT INTO share_links (token, prompt_id, created_by, expires_at) VALUES (?, ?, ?, ?)",
-              (token, prompt_id, user['email'], expires_at))
+              (token, prompt_id, user_email, expires_at))
     conn.commit()
     conn.close()
     return {"token": token, "expires_at": expires_at}
@@ -293,11 +296,13 @@ async def create_share_link(prompt_id: str, request: Request):
 def list_share_links(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM share_links WHERE prompt_id = ? AND created_by = ? ORDER BY created_at DESC",
-              (prompt_id, user['email']))
+              (prompt_id, user_email))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
@@ -306,9 +311,11 @@ def list_share_links(prompt_id: str, request: Request):
 def revoke_share_link(token: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM share_links WHERE token = ? AND created_by = ?", (token, user['email']))
+    c.execute("DELETE FROM share_links WHERE token = ? AND created_by = ?", (token, user_email))
     conn.commit()
     conn.close()
     return {"status": "revoked"}
@@ -317,6 +324,7 @@ def revoke_share_link(token: str, request: Request):
 async def add_prompt(request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
     
     form = await request.form()
     title = form.get("title")
@@ -360,7 +368,7 @@ async def add_prompt(request: Request):
     shared_int = 1 if is_shared == "true" else 0
     c.execute("""INSERT INTO prompts (id, title, prompt, author, tags, image_path, user_email, is_shared, forked_from) 
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-              (str(uuid.uuid4()), title, prompt.strip(), author, tags, image_path_json, user['email'], shared_int, forked_from))
+              (str(uuid.uuid4()), title, prompt.strip(), author, tags, image_path_json, user_email, shared_int, forked_from))
     conn.commit()
     conn.close()
     return {"status": "success"}
@@ -369,6 +377,7 @@ async def add_prompt(request: Request):
 async def edit_prompt(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
 
     form = await request.form()
     title = form.get("title")
@@ -398,7 +407,7 @@ async def edit_prompt(prompt_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Prompt text exists already.")
 
     c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (str(uuid.uuid4()), prompt_id, current_row['title'], current_row['prompt'], current_row['author'], current_row['tags'], current_row['image_path'], user['email']))
+              (str(uuid.uuid4()), prompt_id, current_row['title'], current_row['prompt'], current_row['author'], current_row['tags'], current_row['image_path'], user_email))
 
     saved_filenames = []
     for img in new_images:
@@ -418,7 +427,7 @@ async def edit_prompt(prompt_id: str, request: Request):
         raise HTTPException(status_code=400, detail="At least one image is required.")
 
     image_path_json = json.dumps(final_images)
-    is_owner = (current_row['user_email'] == user['email'])
+    is_owner = (current_row['user_email'] == user_email)
     shared_int = 1 if is_shared == "true" else 0 if is_owner else current_row['is_shared']
 
     c.execute("""UPDATE prompts SET title = ?, prompt = ?, author = ?, tags = ?, image_path = ?, is_shared = ? WHERE id = ?""", 
@@ -431,11 +440,13 @@ async def edit_prompt(prompt_id: str, request: Request):
 async def delete_prompt(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT user_email FROM prompts WHERE id = ?", (prompt_id,))
     row = c.fetchone()
-    if not row or row[0] != user['email']:
+    if not row or row[0] != user_email:
         conn.close()
         raise HTTPException(status_code=403)
         
@@ -471,6 +482,8 @@ async def delete_prompt(prompt_id: str, request: Request):
 async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     
     conn = sqlite3.connect(DB_PATH)
@@ -479,7 +492,7 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
     for pid in ids:
         c.execute("SELECT user_email, image_path FROM prompts WHERE id = ?", (pid,))
         row = c.fetchone()
-        if row and row[0] == user['email']: 
+        if row and row[0] == user_email: 
             files_to_delete = set()
             if row[1]:
                 try: files_to_delete.update(json.loads(str(row[1])))
@@ -509,6 +522,8 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
 async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str = Form(...)):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     clean_tag = new_tag.strip()
     if not clean_tag: return {"status": "success"}
@@ -519,7 +534,7 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     for pid in ids:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
-        if current and (current['user_email'] == user['email'] or current['is_shared'] == 1):
+        if current and (current['user_email'] == user_email or current['is_shared'] == 1):
             tags_str = str(current['tags'] or "")
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             
@@ -528,7 +543,7 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
                 new_tags_str = ", ".join(current_tags)
                 
                 c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                          (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user['email']))
+                          (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user_email))
                 
                 c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (new_tags_str, pid))
     conn.commit()
@@ -539,6 +554,8 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
 async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language: str = Form("English")):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     if not ids: return {"status": "success"}
     
@@ -551,7 +568,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
         
-        if current and (current['user_email'] == user['email'] or current['is_shared'] == 1) and current['prompt']:
+        if current and (current['user_email'] == user_email or current['is_shared'] == 1) and current['prompt']:
             prompt_text = str(current['prompt'])
             instruction = f"""
             Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
@@ -579,7 +596,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
                 if added:
                     new_tags_str = ", ".join(current_tags)
                     c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                              (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user['email']))
+                              (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user_email))
                     c.execute("UPDATE prompts SET tags = ? WHERE id = ?", (new_tags_str, pid))
                     conn.commit()
             except Exception as e:
@@ -603,15 +620,17 @@ async def increment_copy(prompt_id: str, request: Request):
 async def toggle_favorite(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT 1 FROM favorites WHERE user_email = ? AND prompt_id = ?", (user['email'], prompt_id))
+    c.execute("SELECT 1 FROM favorites WHERE user_email = ? AND prompt_id = ?", (user_email, prompt_id))
     is_fav = c.fetchone()
     if is_fav:
-        c.execute("DELETE FROM favorites WHERE user_email = ? AND prompt_id = ?", (user['email'], prompt_id))
+        c.execute("DELETE FROM favorites WHERE user_email = ? AND prompt_id = ?", (user_email, prompt_id))
         status = False
     else:
-        c.execute("INSERT INTO favorites (user_email, prompt_id) VALUES (?, ?)", (user['email'], prompt_id))
+        c.execute("INSERT INTO favorites (user_email, prompt_id) VALUES (?, ?)", (user_email, prompt_id))
         status = True
     conn.commit()
     conn.close()
@@ -690,6 +709,8 @@ async def auto_generate_title(request: Request, prompt: str = Form(...), languag
 async def get_comments(prompt_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -702,104 +723,119 @@ async def get_comments(prompt_id: str, request: Request):
         WHERE c.prompt_id = ?
         GROUP BY c.id
         ORDER BY c.created_at ASC
-    """, (user['email'], prompt_id))
+    """, (user_email, prompt_id))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
+    
     top_level = [r for r in rows if not r['parent_id']]
     replies_map = {}
     for r in rows:
         if r['parent_id']:
             replies_map.setdefault(r['parent_id'], []).append(r)
+            
     for row in top_level:
         row['replies'] = replies_map.get(row['id'], [])
-        row['is_mine'] = (row['author_email'] == user['email'])
+        row['is_mine'] = (row['author_email'] == user_email)
         row['user_downvoted'] = bool(row['user_downvoted'])
         for reply in row['replies']:
-            reply['is_mine'] = (reply['author_email'] == user['email'])
+            reply['is_mine'] = (reply['author_email'] == user_email)
             reply['user_downvoted'] = bool(reply['user_downvoted'])
             reply['replies'] = []
     return top_level
 
-# Using BackgroundTasks to safely run the email routine outside the request context
 @app.post("/api/prompts/{prompt_id}/comments")
 async def add_comment(prompt_id: str, request: Request, background_tasks: BackgroundTasks,
                       body: str = Form(...), parent_id: Optional[str] = Form(None)):
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401)
-    body = body.strip()
-    if not body: raise HTTPException(status_code=400, detail="Comment cannot be empty.")
-    parent_id = parent_id.strip() if parent_id else None
+    try:
+        user = request.session.get('user')
+        if not user: raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        user_email = str(user.get('email', 'unknown'))
+        
+        body = body.strip()
+        if not body: raise HTTPException(status_code=400, detail="Comment cannot be empty.")
+        
+        parent_id = parent_id.strip() if parent_id else None
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
 
-    c.execute("SELECT title, user_email FROM prompts WHERE id = ? AND (is_shared = 1 OR user_email = ?)",
-              (prompt_id, user['email']))
-    prompt_row = c.fetchone()
-    if not prompt_row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Prompt not found.")
-
-    parent_row = None
-    if parent_id:
-        c.execute("SELECT author_email FROM comments WHERE id = ? AND prompt_id = ?", (parent_id, prompt_id))
-        parent_row = c.fetchone()
-        if not parent_row:
+        c.execute("SELECT title, user_email FROM prompts WHERE id = ?", (prompt_id,))
+        prompt_row = c.fetchone()
+        if not prompt_row:
             conn.close()
-            raise HTTPException(status_code=404, detail="Parent comment not found.")
+            raise HTTPException(status_code=404, detail="Prompt not found.")
 
-    comment_id = str(uuid.uuid4())
-    # Force safe string conversion just in case
-    author_name = str(user.get('name') or user.get('preferred_username') or user['email'])
-    c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
-              (comment_id, prompt_id, parent_id, user['email'], author_name, body))
-    conn.commit()
-    conn.close()
+        parent_row = None
+        if parent_id:
+            c.execute("SELECT author_email FROM comments WHERE id = ? AND prompt_id = ?", (parent_id, prompt_id))
+            parent_row = c.fetchone()
+            if not parent_row:
+                conn.close()
+                raise HTTPException(status_code=404, detail="Parent comment not found.")
 
-    # Safely convert to string before HTML formatting to prevent TypeErrors (500s)
-    prompt_title = str(prompt_row['title'] or 'Untitled')
-    commenter = author_name
-
-    if parent_row and parent_row['author_email'] != user['email']:
-        notify_to = parent_row['author_email']
-        subject = f'New reply to your comment on "{prompt_title}"'
-        html_body = (f'<p><b>{html_mod.escape(commenter)}</b> replied to your comment on '
-                     f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
-                     f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
-                     f'{html_mod.escape(str(body))}</blockquote>'
-                     f'<p>Log in to NanoBanana Prompts to view the full thread.</p>')
+        comment_id = str(uuid.uuid4())
         
-        background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
+        # Sicherer Fallback falls Namen im OIDC-Token fehlen
+        author_name = str(user.get('name') or user.get('preferred_username') or user_email)
         
-    elif not parent_id and prompt_row['user_email'] != user['email']:
-        notify_to = prompt_row['user_email']
-        subject = f'New comment on your prompt "{prompt_title}"'
-        html_body = (f'<p><b>{html_mod.escape(commenter)}</b> commented on your prompt '
-                     f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
-                     f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
-                     f'{html_mod.escape(str(body))}</blockquote>'
-                     f'<p>Log in to NanoBanana Prompts to view and reply.</p>')
-                     
-        background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
+        c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
+                  (comment_id, prompt_id, parent_id, user_email, author_name, body))
+        conn.commit()
+        conn.close()
 
-    return {"status": "ok", "id": comment_id}
+        # E-Mail Logik abgetrennt - Variablen extrem sicher als String konvertiert!
+        prompt_title = str(prompt_row['title'] or 'Untitled')
+        commenter = author_name
+
+        if parent_row and parent_row['author_email'] and parent_row['author_email'] != user_email:
+            notify_to = str(parent_row['author_email'])
+            subject = f'New reply to your comment on "{prompt_title}"'
+            html_body = (f'<p><b>{html_mod.escape(commenter)}</b> replied to your comment on '
+                         f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
+                         f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
+                         f'{html_mod.escape(str(body))}</blockquote>'
+                         f'<p>Log in to NanoBanana Prompts to view the full thread.</p>')
+            
+            background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
+            
+        elif not parent_id and prompt_row['user_email'] and prompt_row['user_email'] != user_email:
+            notify_to = str(prompt_row['user_email'])
+            subject = f'New comment on your prompt "{prompt_title}"'
+            html_body = (f'<p><b>{html_mod.escape(commenter)}</b> commented on your prompt '
+                         f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
+                         f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
+                         f'{html_mod.escape(str(body))}</blockquote>'
+                         f'<p>Log in to NanoBanana Prompts to view and reply.</p>')
+                         
+            background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
+
+        return {"status": "ok", "id": comment_id}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Falls es jemals wieder crasht, siehst du den genauen Fehlergrund im UI!
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
 @app.post("/api/comments/{comment_id}/downvote")
 async def toggle_downvote(comment_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT 1 FROM comment_votes WHERE comment_id = ? AND user_email = ?",
-              (comment_id, user['email']))
+              (comment_id, user_email))
     if c.fetchone():
         c.execute("DELETE FROM comment_votes WHERE comment_id = ? AND user_email = ?",
-                  (comment_id, user['email']))
+                  (comment_id, user_email))
         voted = False
     else:
         c.execute("INSERT INTO comment_votes (comment_id, user_email) VALUES (?, ?)",
-                  (comment_id, user['email']))
+                  (comment_id, user_email))
         voted = True
     conn.commit()
     conn.close()
@@ -809,6 +845,8 @@ async def toggle_downvote(comment_id: str, request: Request):
 async def delete_comment(comment_id: str, request: Request):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
+    user_email = str(user.get('email', 'unknown'))
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT author_email FROM comments WHERE id = ?", (comment_id,))
@@ -816,7 +854,7 @@ async def delete_comment(comment_id: str, request: Request):
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Comment not found.")
-    if row[0] != user['email']:
+    if row[0] != user_email:
         conn.close()
         raise HTTPException(status_code=403, detail="Not your comment.")
     c.execute("DELETE FROM comments WHERE id = ? OR parent_id = ?", (comment_id, comment_id))
