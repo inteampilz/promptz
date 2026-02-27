@@ -8,7 +8,7 @@ import zipfile
 import html as html_mod
 from datetime import datetime, timedelta
 from typing import Optional, List
-from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -19,7 +19,6 @@ from google.genai import types
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import asyncio
 
 app = FastAPI()
 
@@ -99,6 +98,7 @@ def init_db():
 
 init_db()
 
+# Removed the async wrapper and simplified the email sender for BackgroundTasks
 def _send_email_sync(to: str, subject: str, body_html: str):
     if not (SMTP_HOST and SMTP_FROM and to):
         return
@@ -117,10 +117,6 @@ def _send_email_sync(to: str, subject: str, body_html: str):
             server.sendmail(SMTP_FROM, to, msg.as_string())
     except Exception:
         pass  # Never let email errors break the API
-
-async def send_notification_email(to: str, subject: str, body_html: str):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _send_email_sync, to, subject, body_html)
 
 app.mount("/images", StaticFiles(directory=IMG_DIR, html=True), name="images")
 
@@ -724,8 +720,9 @@ async def get_comments(prompt_id: str, request: Request):
             reply['replies'] = []
     return top_level
 
+# Using BackgroundTasks to safely run the email routine outside the request context
 @app.post("/api/prompts/{prompt_id}/comments")
-async def add_comment(prompt_id: str, request: Request,
+async def add_comment(prompt_id: str, request: Request, background_tasks: BackgroundTasks,
                       body: str = Form(...), parent_id: Optional[str] = Form(None)):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
@@ -753,13 +750,15 @@ async def add_comment(prompt_id: str, request: Request,
             raise HTTPException(status_code=404, detail="Parent comment not found.")
 
     comment_id = str(uuid.uuid4())
-    author_name = user.get('name') or user.get('preferred_username') or user['email']
+    # Force safe string conversion just in case
+    author_name = str(user.get('name') or user.get('preferred_username') or user['email'])
     c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
               (comment_id, prompt_id, parent_id, user['email'], author_name, body))
     conn.commit()
     conn.close()
 
-    prompt_title = prompt_row['title'] or 'Untitled'
+    # Safely convert to string before HTML formatting to prevent TypeErrors (500s)
+    prompt_title = str(prompt_row['title'] or 'Untitled')
     commenter = author_name
 
     if parent_row and parent_row['author_email'] != user['email']:
@@ -768,18 +767,21 @@ async def add_comment(prompt_id: str, request: Request,
         html_body = (f'<p><b>{html_mod.escape(commenter)}</b> replied to your comment on '
                      f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
                      f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
-                     f'{html_mod.escape(body)}</blockquote>'
+                     f'{html_mod.escape(str(body))}</blockquote>'
                      f'<p>Log in to NanoBanana Prompts to view the full thread.</p>')
-        asyncio.create_task(send_notification_email(notify_to, subject, html_body))
+        
+        background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
+        
     elif not parent_id and prompt_row['user_email'] != user['email']:
         notify_to = prompt_row['user_email']
         subject = f'New comment on your prompt "{prompt_title}"'
         html_body = (f'<p><b>{html_mod.escape(commenter)}</b> commented on your prompt '
                      f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
                      f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
-                     f'{html_mod.escape(body)}</blockquote>'
+                     f'{html_mod.escape(str(body))}</blockquote>'
                      f'<p>Log in to NanoBanana Prompts to view and reply.</p>')
-        asyncio.create_task(send_notification_email(notify_to, subject, html_body))
+                     
+        background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
 
     return {"status": "ok", "id": comment_id}
 
@@ -1140,7 +1142,6 @@ def view_shared_prompt(token: str):
         conn.close()
         return _err("Link not found.", 404)
         
-    # FALLBACK: Sichert ab, falls das Datum durch ältere Backups defekt ist
     try:
         exp_date = datetime.strptime(link['expires_at'], "%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -1156,7 +1157,6 @@ def view_shared_prompt(token: str):
     if not prompt:
         return _err("Prompt not found.", 404)
 
-    # FALLBACK: Verhindert 500 Fehler, wenn ältere Prompts noch einen einfachen Text statt JSON haben
     raw_image_path = prompt['image_path']
     if not raw_image_path:
         images = []
@@ -1170,7 +1170,6 @@ def view_shared_prompt(token: str):
         except Exception:
             images = [str(raw_image_path)]
 
-    # FIX: Sichere Typkonvertierung für alle DB-Felder (verhindert TypeError / AttributeError bei fehlerhaften DB-Einträgen)
     tags_str = str(prompt['tags'] or '')
     tags = [t.strip() for t in tags_str.split(',') if t.strip()]
     expires_label = exp_date.strftime("%Y-%m-%d %H:%M UTC")
@@ -1180,7 +1179,6 @@ def view_shared_prompt(token: str):
     tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(str(t))}</span>' for t in tags)
     imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
     
-    # FIX: Ersetze das Schließen von Skript-Tags im JSON String, um HTML-Injection/Abbrüche zu verhindern
     prompt_str  = str(prompt['prompt'] or '')
     prompt_js   = json.dumps(prompt_str).replace("</", "<\\/")
 
