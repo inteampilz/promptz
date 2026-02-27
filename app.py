@@ -19,6 +19,7 @@ from google.genai import types
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import asyncio
 
 app = FastAPI()
 
@@ -52,7 +53,7 @@ def init_db():
                  (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, author TEXT, tags TEXT, 
                   image_path TEXT, user_email TEXT, is_shared INTEGER)''')
     
-    # DB Schema Migrations
+    # DB Schema Migrations for Prompts
     c.execute("PRAGMA table_info(prompts)")
     columns = [col[1] for col in c.fetchall()]
     if 'copy_count' not in columns:
@@ -89,6 +90,15 @@ def init_db():
                  (id TEXT PRIMARY KEY, prompt_id TEXT, parent_id TEXT,
                  author_email TEXT, author_name TEXT, body TEXT,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # DB Schema Migrations for Comments (Fixes the missing parent_id error)
+    c.execute("PRAGMA table_info(comments)")
+    comment_cols = [col[1] for col in c.fetchall()]
+    if comment_cols:
+        if 'parent_id' not in comment_cols:
+            c.execute("ALTER TABLE comments ADD COLUMN parent_id TEXT")
+        if 'author_name' not in comment_cols:
+            c.execute("ALTER TABLE comments ADD COLUMN author_name TEXT")
 
     c.execute('''CREATE TABLE IF NOT EXISTS comment_votes
                  (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
@@ -777,7 +787,6 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
 
         comment_id = str(uuid.uuid4())
         
-        # Sicherer Fallback falls Namen im OIDC-Token fehlen
         author_name = str(user.get('name') or user.get('preferred_username') or user_email)
         
         c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
@@ -785,7 +794,6 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
         conn.commit()
         conn.close()
 
-        # E-Mail Logik abgetrennt - Variablen extrem sicher als String konvertiert!
         prompt_title = str(prompt_row['title'] or 'Untitled')
         commenter = author_name
 
@@ -816,7 +824,6 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
     except HTTPException:
         raise
     except Exception as e:
-        # Falls es jemals wieder crasht, siehst du den genauen Fehlergrund im UI!
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
 @app.post("/api/comments/{comment_id}/downvote")
