@@ -88,8 +88,8 @@ def init_db():
 
     c.execute('''CREATE TABLE IF NOT EXISTS comments
                  (id TEXT PRIMARY KEY, prompt_id TEXT, parent_id TEXT,
-                  author_email TEXT, author_name TEXT, body TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                 author_email TEXT, author_name TEXT, body TEXT,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS comment_votes
                  (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
@@ -193,7 +193,6 @@ def get_prompts(request: Request):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    # Left join to grab the title of the parent prompt if it was forked, and collection_ids for this user
     c.execute("""
         SELECT p.*, CASE WHEN f.prompt_id IS NOT NULL THEN 1 ELSE 0 END as is_favorite,
                parent.title as forked_from_title,
@@ -214,7 +213,7 @@ def get_prompts(request: Request):
         row['is_mine'] = (row['user_email'] == user['email'])
         row['is_favorite'] = bool(row['is_favorite'])
         raw_cids = row.get('collection_ids')
-        row['collection_ids'] = raw_cids.split(',') if raw_cids else []
+        row['collection_ids'] = str(raw_cids).split(',') if raw_cids else []
     return rows
 
 @app.get("/api/prompts/{prompt_id}/history")
@@ -251,7 +250,6 @@ async def rollback_prompt(prompt_id: str, history_id: str, request: Request):
         conn.close()
         raise HTTPException(status_code=404, detail="History entry not found.")
 
-    # Save current state to history before overwriting (so the rollback itself is undoable)
     c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
               (str(uuid.uuid4()), prompt_id, current['title'], current['prompt'],
@@ -353,7 +351,6 @@ async def add_prompt(request: Request):
     final_images = []
     for item in media_order:
         if item.startswith("existing:"):
-            # When forking, we copy existing images into the new prompt
             final_images.append(item.split(":", 1)[1])
         elif item.startswith("new:"):
             idx = int(item.split(":")[1])
@@ -451,15 +448,14 @@ async def delete_prompt(prompt_id: str, request: Request):
     
     files_to_delete = set()
     if cur_img and cur_img[0]:
-        try: files_to_delete.update(json.loads(cur_img[0]))
-        except: files_to_delete.add(cur_img[0])
+        try: files_to_delete.update(json.loads(str(cur_img[0])))
+        except: files_to_delete.add(str(cur_img[0]))
     c.execute("SELECT image_path FROM prompt_history WHERE prompt_id = ?", (prompt_id,))
     for h_row in c.fetchall():
         if h_row[0]:
-            try: files_to_delete.update(json.loads(h_row[0]))
-            except: files_to_delete.add(h_row[0])
+            try: files_to_delete.update(json.loads(str(h_row[0])))
+            except: files_to_delete.add(str(h_row[0]))
             
-    # Remove file from disk only if no other prompt uses it (safe cleanup)
     for f in files_to_delete:
         c.execute("SELECT count(*) FROM prompts WHERE image_path LIKE ?", (f'%{f}%',))
         usage_count = c.fetchone()[0]
@@ -490,13 +486,13 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
         if row and row[0] == user['email']: 
             files_to_delete = set()
             if row[1]:
-                try: files_to_delete.update(json.loads(row[1]))
-                except: files_to_delete.add(row[1])
+                try: files_to_delete.update(json.loads(str(row[1])))
+                except: files_to_delete.add(str(row[1]))
             c.execute("SELECT image_path FROM prompt_history WHERE prompt_id = ?", (pid,))
             for h_row in c.fetchall():
                 if h_row[0]:
-                    try: files_to_delete.update(json.loads(h_row[0]))
-                    except: files_to_delete.add(h_row[0])
+                    try: files_to_delete.update(json.loads(str(h_row[0])))
+                    except: files_to_delete.add(str(h_row[0]))
                     
             for f in files_to_delete:
                 c.execute("SELECT count(*) FROM prompts WHERE image_path LIKE ?", (f'%{f}%',))
@@ -527,16 +523,14 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     for pid in ids:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
-        # Erlaube Tagging, wenn man Besitzer ist ODER der Prompt geteilt ist (Wiki Modus)
         if current and (current['user_email'] == user['email'] or current['is_shared'] == 1):
-            tags_str = current['tags'] if current['tags'] else ""
+            tags_str = str(current['tags'] or "")
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             
             if clean_tag not in current_tags:
                 current_tags.append(clean_tag)
                 new_tags_str = ", ".join(current_tags)
                 
-                # History-Backup für den Wiki-Modus abspeichern
                 c.execute("""INSERT INTO prompt_history (history_id, prompt_id, title, prompt, author, tags, image_path, edited_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                           (str(uuid.uuid4()), pid, current['title'], current['prompt'], current['author'], current['tags'], current['image_path'], user['email']))
                 
@@ -555,16 +549,14 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
     client = genai.Client()
     
     for pid in ids:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
         
-        # Nur anwenden wenn man Rechte hat (Besitzer oder Wiki-Modus) und Prompt-Text existiert
         if current and (current['user_email'] == user['email'] or current['is_shared'] == 1) and current['prompt']:
-            prompt_text = current['prompt']
+            prompt_text = str(current['prompt'])
             instruction = f"""
             Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
             Output EXACTLY a comma-separated list of tags in lowercase. No markdown, no further explanations.
@@ -579,7 +571,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
                 new_tags_raw = response.text.strip().replace('\n', '').replace('"', '')
                 new_tags = [t.strip() for t in new_tags_raw.split(',') if t.strip()]
                 
-                tags_str = current['tags'] if current['tags'] else ""
+                tags_str = str(current['tags'] or "")
                 current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
                 
                 added = False
@@ -596,7 +588,6 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
                     conn.commit()
             except Exception as e:
                 print(f"Error auto-tagging prompt {pid}: {e}")
-                # Wir überspringen Fehler (z.B. API Limits) bei einzelnen Prompts und machen mit den restlichen weiter
                 
     conn.close()
     return {"status": "success"}
@@ -848,7 +839,7 @@ async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = 
     
     for row in rows:
         if not row['tags']: continue
-        current_tags = [t.strip() for t in row['tags'].split(',')]
+        current_tags = [t.strip() for t in str(row['tags']).split(',')]
         if old_tag in current_tags:
             updated_tags = []
             for t in current_tags:
@@ -1075,7 +1066,7 @@ async def import_data(request: Request, file: UploadFile = File(...)):
     id_map = {} 
     
     for row in prompts_to_insert:
-        prompt_text = row.get("prompt", "").strip()
+        prompt_text = str(row.get("prompt", "")).strip()
         if not prompt_text: continue
         
         old_id = row.get("id")
@@ -1098,7 +1089,6 @@ async def import_data(request: Request, file: UploadFile = File(...)):
         copy_count = int(row.get("copy_count", 0))
         forked_from = row.get("forked_from", None)
         
-        # Restore internal parent linking if the parent was also imported
         if forked_from and forked_from in id_map:
             forked_from = id_map[forked_from]
             
@@ -1172,23 +1162,27 @@ def view_shared_prompt(token: str):
         images = []
     else:
         try:
-            parsed_images = json.loads(raw_image_path)
+            parsed_images = json.loads(str(raw_image_path))
             if isinstance(parsed_images, list):
                 images = parsed_images
             else:
                 images = [str(parsed_images)]
         except Exception:
-            images = [raw_image_path]
+            images = [str(raw_image_path)]
 
-    tags = [t.strip() for t in (prompt['tags'] or '').split(',') if t.strip()]
+    # FIX: Sichere Typkonvertierung für alle DB-Felder (verhindert TypeError / AttributeError bei fehlerhaften DB-Einträgen)
+    tags_str = str(prompt['tags'] or '')
+    tags = [t.strip() for t in tags_str.split(',') if t.strip()]
     expires_label = exp_date.strftime("%Y-%m-%d %H:%M UTC")
 
-    safe_title  = html_mod.escape(prompt['title'] or '')
-    safe_author = html_mod.escape(prompt['author'] or '')
-    tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(t)}</span>' for t in tags)
-    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(img)}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
-    # Embed raw prompt as a JSON string so JS can handle placeholders safely
-    prompt_js   = json.dumps(prompt['prompt'] or '')
+    safe_title  = html_mod.escape(str(prompt['title'] or 'Untitled'))
+    safe_author = html_mod.escape(str(prompt['author'] or 'Unknown'))
+    tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(str(t))}</span>' for t in tags)
+    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
+    
+    # FIX: Ersetze das Schließen von Skript-Tags im JSON String, um HTML-Injection/Abbrüche zu verhindern
+    prompt_str  = str(prompt['prompt'] or '')
+    prompt_js   = json.dumps(prompt_str).replace("</", "<\\/")
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
 <head>
@@ -1488,12 +1482,14 @@ def get_html(request: Request):
                     <input type="hidden" id="editPromptId" name="editPromptId" value="">
                     <input type="hidden" id="formForkedFrom" name="forked_from" value="">
                     
-                    <div class="flex gap-2 mb-3">
-                        <input type="text" id="formTitle" name="title" placeholder="Title" required class="flex-grow p-2 rounded bg-gray-700 border border-gray-600 text-white">
+                    <div class="flex justify-between items-end mb-1">
+                        <label class="text-sm font-medium text-gray-400">Title</label>
                         <button type="button" onclick="autoGenerateTitle(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-3 py-1 rounded transition-colors focus:outline-none whitespace-nowrap flex-shrink-0" title="Generate title from prompt text via Gemini">
                             ✨ Auto-Title
                         </button>
                     </div>
+                    <input type="text" id="formTitle" name="title" placeholder="Title" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white transition-colors">
+                    
                     <div class="relative w-full mb-3">
                         <input type="text" id="formAuthor" name="author" placeholder="Author/Creator" required autocomplete="off" oninput="showAuthorSuggestions(this.value)" class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white">
                         <div id="authorSuggestions" class="autocomplete-list absolute z-10 w-full bg-gray-600 border border-gray-500 rounded mt-1 hidden max-h-40 overflow-y-auto shadow-lg text-sm"></div>
@@ -1665,7 +1661,7 @@ def get_html(request: Request):
                 </div>
             </div>
         </div>
-
+        
         <div id="commentsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
             <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg flex flex-col gap-4" style="max-height:90vh">
                 <div class="flex justify-between items-center flex-shrink-0">
@@ -2326,51 +2322,12 @@ def get_html(request: Request):
                     alert("Failed to connect to Auto-Tag API."); 
                 }
                 
-                btn.innerText = originalText;
-                btn.disabled = false;
-            }
-
-            async function autoGenerateTitle(btn) {
-                const promptField = document.getElementById('formPrompt');
-                const titleField = document.getElementById('formTitle');
-                const langField = document.getElementById('tagLanguage');
-
-                if (!promptField.value.trim()) {
-                    alert("Please enter or extract a prompt text first so Gemini knows what to title!");
-                    return;
-                }
-
-                const originalText = btn.innerText;
-                btn.innerText = '⏳ Generating...';
-                btn.disabled = true;
-
-                const formData = new FormData();
-                formData.append('prompt', promptField.value);
-                formData.append('language', langField.value);
-
-                try {
-                    const res = await fetch('/api/title/auto', { method: 'POST', body: formData });
-                    if (res.ok) {
-                        const data = await res.json();
-                        if (data.title) {
-                            titleField.value = data.title;
-                            titleField.classList.remove('flash-success');
-                            void titleField.offsetWidth;
-                            titleField.classList.add('flash-success');
-                        }
-                    } else {
-                        const err = await res.json();
-                        alert("Error generating title: " + err.detail);
-                    }
-                } catch (e) {
-                    alert("Failed to connect to Auto-Title API.");
-                }
-
-                btn.innerText = originalText;
+                btn.innerText = originalText; 
                 btn.disabled = false;
             }
 
             // ── Comments ──────────────────────────────────────────────────────
+            let currentCommentPromptId = null;
 
             async function openCommentsModal(promptId) {
                 currentCommentPromptId = promptId;
@@ -2866,7 +2823,6 @@ def get_html(request: Request):
             }
 
             let currentSharePromptId = null;
-            let currentCommentPromptId = null;
 
             async function openShareModal(promptId) {
                 currentSharePromptId = promptId;
