@@ -91,14 +91,18 @@ def init_db():
                  author_email TEXT, author_name TEXT, body TEXT,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
-    # DB Schema Migrations for Comments (Fixes the missing parent_id error)
+    # DB Schema Migrations for Comments (Fixes ALL missing columns)
     c.execute("PRAGMA table_info(comments)")
     comment_cols = [col[1] for col in c.fetchall()]
     if comment_cols:
         if 'parent_id' not in comment_cols:
             c.execute("ALTER TABLE comments ADD COLUMN parent_id TEXT")
+        if 'author_email' not in comment_cols:
+            c.execute("ALTER TABLE comments ADD COLUMN author_email TEXT")
         if 'author_name' not in comment_cols:
             c.execute("ALTER TABLE comments ADD COLUMN author_name TEXT")
+        if 'body' not in comment_cols:
+            c.execute("ALTER TABLE comments ADD COLUMN body TEXT")
 
     c.execute('''CREATE TABLE IF NOT EXISTS comment_votes
                  (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
