@@ -76,6 +76,14 @@ def init_db():
     if 'created_at' not in sl_cols:
         c.execute("ALTER TABLE share_links ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
+    c.execute('''CREATE TABLE IF NOT EXISTS comments
+                 (id TEXT PRIMARY KEY, prompt_id TEXT, user_email TEXT, author TEXT,
+                  content TEXT, upvotes INTEGER DEFAULT 0,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS comment_upvotes
+                 (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
+
     conn.commit()
     conn.close()
 
@@ -588,6 +596,102 @@ async def toggle_favorite(prompt_id: str, request: Request):
     conn.commit()
     conn.close()
     return {"is_favorite": status}
+
+@app.get("/api/prompts/{prompt_id}/comments")
+def get_comments(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.*, CASE WHEN cu.user_email IS NOT NULL THEN 1 ELSE 0 END as user_upvoted
+        FROM comments c
+        LEFT JOIN comment_upvotes cu ON c.id = cu.comment_id AND cu.user_email = ?
+        WHERE c.prompt_id = ?
+        ORDER BY c.upvotes DESC, c.created_at ASC
+    """, (user['email'], prompt_id))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    for row in rows:
+        row['is_mine'] = (row['user_email'] == user['email'])
+        row['user_upvoted'] = bool(row['user_upvoted'])
+    return rows
+
+@app.post("/api/prompts/{prompt_id}/comments")
+async def add_comment(prompt_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+    content = (body.get("content") or "").strip()
+    author = (body.get("author") or user.get('name') or user['email']).strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required.")
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="Comment too long (max 2000 chars).")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id FROM prompts WHERE id = ? AND (is_shared = 1 OR user_email = ?)", (prompt_id, user['email']))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Prompt not found.")
+    comment_id = str(uuid.uuid4())
+    c.execute("INSERT INTO comments (id, prompt_id, user_email, author, content) VALUES (?, ?, ?, ?, ?)",
+              (comment_id, prompt_id, user['email'], author, content))
+    conn.commit()
+    c.execute("SELECT * FROM comments WHERE id = ?", (comment_id,))
+    row = dict(c.fetchone())
+    conn.close()
+    row['is_mine'] = True
+    row['user_upvoted'] = False
+    return row
+
+@app.post("/api/comments/{comment_id}/upvote")
+async def upvote_comment(comment_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM comments WHERE id = ?", (comment_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Comment not found.")
+    c.execute("SELECT 1 FROM comment_upvotes WHERE comment_id = ? AND user_email = ?", (comment_id, user['email']))
+    already_upvoted = c.fetchone()
+    if already_upvoted:
+        c.execute("DELETE FROM comment_upvotes WHERE comment_id = ? AND user_email = ?", (comment_id, user['email']))
+        c.execute("UPDATE comments SET upvotes = MAX(0, upvotes - 1) WHERE id = ?", (comment_id,))
+        upvoted = False
+    else:
+        c.execute("INSERT INTO comment_upvotes (comment_id, user_email) VALUES (?, ?)", (comment_id, user['email']))
+        c.execute("UPDATE comments SET upvotes = upvotes + 1 WHERE id = ?", (comment_id,))
+        upvoted = True
+    conn.commit()
+    c.execute("SELECT upvotes FROM comments WHERE id = ?", (comment_id,))
+    new_count = c.fetchone()[0]
+    conn.close()
+    return {"upvoted": upvoted, "upvotes": new_count}
+
+@app.delete("/api/comments/{comment_id}")
+async def delete_comment(comment_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_email FROM comments WHERE id = ?", (comment_id,))
+    row = c.fetchone()
+    if not row or row[0] != user['email']:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    c.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+    c.execute("DELETE FROM comment_upvotes WHERE comment_id = ?", (comment_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
 
 @app.post("/api/extract-metadata")
 async def extract_metadata(request: Request, image: Optional[UploadFile] = File(None), existing_image: Optional[str] = Form(None)):
@@ -1463,6 +1567,27 @@ def get_html(request: Request):
             </div>
         </div>
 
+        <div id="commentsModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-2xl font-bold">💬 Comments</h2>
+                    <button onclick="closeModal('commentsModal')" class="text-gray-400 hover:text-white text-xl font-bold">✕</button>
+                </div>
+                <div id="commentsContainer" class="flex-grow overflow-y-auto flex flex-col gap-3 mb-4 min-h-0 pr-1"></div>
+                <div class="border-t border-gray-700 pt-4 flex flex-col gap-2">
+                    <textarea id="commentInput" placeholder="Write a comment..." maxlength="2000"
+                              class="w-full p-2 rounded bg-gray-700 border border-gray-600 text-white h-20 resize-none focus:outline-none focus:border-yellow-400 text-sm"></textarea>
+                    <div class="flex justify-between items-center">
+                        <span id="commentCharCount" class="text-xs text-gray-500">0 / 2000</span>
+                        <button onclick="submitComment()" id="submitCommentBtn"
+                                class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-2 px-4 rounded text-sm transition-colors">
+                            Post Comment
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div id="shareLinkModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
             <div class="bg-gray-800 p-6 rounded-lg w-full max-w-md flex flex-col gap-4">
                 <div class="flex justify-between items-center">
@@ -2327,6 +2452,7 @@ def get_html(request: Request):
                             <button onclick="openHistoryModal('${p.id}')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-200 py-1 px-2 rounded text-sm transition-colors border border-gray-600">History</button>
                             <button onclick="openCollectionAssignModal('${p.id}')" class="flex-1 bg-teal-900 hover:bg-teal-800 text-teal-200 py-1 px-2 rounded text-sm transition-colors border border-teal-800" title="Add to Collection">📁 Collect</button>
                             <button onclick="openShareModal('${p.id}')" class="flex-1 bg-yellow-800 hover:bg-yellow-700 text-yellow-200 py-1 px-2 rounded text-sm transition-colors border border-yellow-700" title="Share link">🔗 Share</button>
+                            <button onclick="openCommentsModal('${p.id}')" class="flex-1 bg-indigo-900 hover:bg-indigo-800 text-indigo-200 py-1 px-2 rounded text-sm transition-colors border border-indigo-800" title="View/add comments">💬 Comments</button>
                             ${deleteBtn}
                         </div>
                     `;
@@ -2801,6 +2927,130 @@ def get_html(request: Request):
 
             function copyToClipboard(btn, text, promptId) {
                 executeCopyFinal(btn, text, promptId);
+            }
+
+            // --- COMMENTS LOGIC ---
+            let currentCommentsPromptId = null;
+
+            document.getElementById('commentInput').addEventListener('input', function() {
+                document.getElementById('commentCharCount').innerText = this.value.length + ' / 2000';
+            });
+
+            async function openCommentsModal(promptId) {
+                currentCommentsPromptId = promptId;
+                document.getElementById('commentInput').value = '';
+                document.getElementById('commentCharCount').innerText = '0 / 2000';
+                document.getElementById('commentsContainer').innerHTML = '<p class="text-gray-400 italic text-center py-8">Loading...</p>';
+                document.getElementById('commentsModal').classList.remove('hidden');
+                await loadComments(promptId);
+            }
+
+            async function loadComments(promptId) {
+                const container = document.getElementById('commentsContainer');
+                try {
+                    const res = await fetch(`/api/prompts/${promptId}/comments`);
+                    if (!res.ok) { container.innerHTML = '<p class="text-red-400 italic text-center py-8">Failed to load comments.</p>'; return; }
+                    const comments = await res.json();
+                    if (comments.length === 0) {
+                        container.innerHTML = '<p class="text-gray-400 italic text-center py-8">No comments yet. Be the first!</p>';
+                        return;
+                    }
+                    container.innerHTML = comments.map(c => renderComment(c)).join('');
+                } catch(e) {
+                    container.innerHTML = '<p class="text-red-400 italic text-center py-8">Error loading comments.</p>';
+                }
+            }
+
+            function renderComment(c) {
+                const safeAuthor = escapeHTML(c.author);
+                const safeContent = escapeHTML(c.content);
+                const date = new Date(c.created_at + 'Z').toLocaleString();
+                const upvoteActive = c.user_upvoted ? 'text-yellow-400 font-bold' : 'text-gray-400 hover:text-yellow-400';
+                const deleteBtnHtml = c.is_mine
+                    ? `<button onclick="deleteComment('${c.id}')" class="text-xs text-red-500 hover:text-red-400 transition-colors ml-2 flex-shrink-0" title="Delete comment">🗑️</button>`
+                    : '';
+                return `
+                    <div class="bg-gray-900 rounded p-3 border border-gray-700 flex flex-col gap-2" id="comment-${c.id}">
+                        <div class="flex items-start justify-between gap-2">
+                            <div class="min-w-0">
+                                <span class="font-bold text-sm text-white">${safeAuthor}</span>
+                                <span class="text-xs text-gray-500 ml-2">${date}</span>
+                            </div>
+                            <div class="flex items-center gap-1 flex-shrink-0">
+                                <button onclick="toggleCommentUpvote('${c.id}')" id="upvote-btn-${c.id}"
+                                        class="flex items-center gap-1 text-sm transition-colors ${upvoteActive} focus:outline-none" title="Upvote">
+                                    ▲ <span id="upvote-count-${c.id}">${c.upvotes}</span>
+                                </button>
+                                ${deleteBtnHtml}
+                            </div>
+                        </div>
+                        <p class="text-sm text-gray-300 break-words whitespace-pre-wrap">${safeContent}</p>
+                    </div>
+                `;
+            }
+
+            async function submitComment() {
+                if (!currentCommentsPromptId) return;
+                const input = document.getElementById('commentInput');
+                const content = input.value.trim();
+                if (!content) { alert("Please write a comment first."); return; }
+
+                const btn = document.getElementById('submitCommentBtn');
+                btn.innerText = 'Posting...'; btn.disabled = true;
+
+                try {
+                    const res = await fetch(`/api/prompts/${currentCommentsPromptId}/comments`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ content })
+                    });
+                    if (res.ok) {
+                        input.value = '';
+                        document.getElementById('commentCharCount').innerText = '0 / 2000';
+                        await loadComments(currentCommentsPromptId);
+                    } else {
+                        const err = await res.json().catch(() => ({}));
+                        alert('Error: ' + (err.detail || res.status));
+                    }
+                } catch(e) { alert("Failed to post comment."); }
+
+                btn.innerText = 'Post Comment'; btn.disabled = false;
+            }
+
+            async function toggleCommentUpvote(commentId) {
+                try {
+                    const res = await fetch(`/api/comments/${commentId}/upvote`, { method: 'POST' });
+                    if (res.ok) {
+                        const data = await res.json();
+                        const countEl = document.getElementById('upvote-count-' + commentId);
+                        const btnEl = document.getElementById('upvote-btn-' + commentId);
+                        if (countEl) countEl.innerText = data.upvotes;
+                        if (btnEl) {
+                            if (data.upvoted) {
+                                btnEl.classList.remove('text-gray-400', 'hover:text-yellow-400');
+                                btnEl.classList.add('text-yellow-400', 'font-bold');
+                            } else {
+                                btnEl.classList.remove('text-yellow-400', 'font-bold');
+                                btnEl.classList.add('text-gray-400', 'hover:text-yellow-400');
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            async function deleteComment(commentId) {
+                if (!confirm("Delete this comment?")) return;
+                try {
+                    const res = await fetch(`/api/comments/${commentId}`, { method: 'DELETE' });
+                    if (res.ok) {
+                        const el = document.getElementById('comment-' + commentId);
+                        if (el) el.remove();
+                        const container = document.getElementById('commentsContainer');
+                        if (container && container.children.length === 0) {
+                            container.innerHTML = '<p class="text-gray-400 italic text-center py-8">No comments yet. Be the first!</p>';
+                        }
+                    } else { alert("Failed to delete comment."); }
+                } catch(e) { alert("Error deleting comment."); }
             }
 
             // --- COLLECTIONS LOGIC ---
