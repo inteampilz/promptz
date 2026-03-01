@@ -1051,19 +1051,52 @@ def export_data(format: str, request: Request):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
+    # 1. Prompts
     c.execute("SELECT * FROM prompts WHERE is_shared = 1 OR user_email = ?", (user['email'],))
     prompts_rows = [dict(r) for r in c.fetchall()]
+    prompt_ids_set = set(r['id'] for r in prompts_rows)
     
-    prompt_ids = set([r['id'] for r in prompts_rows])
+    # 2. History
     c.execute("SELECT * FROM prompt_history")
-    all_history = [dict(r) for r in c.fetchall()]
-    history_rows = [h for h in all_history if h['prompt_id'] in prompt_ids]
+    history_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
+    
+    # 3. Favorites
+    c.execute("SELECT * FROM favorites WHERE user_email = ?", (user['email'],))
+    favorites_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
+
+    # 4. Comments
+    c.execute("SELECT * FROM comments")
+    comments_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
+    comment_ids_set = set(r['id'] for r in comments_rows)
+
+    # 5. Comment Votes
+    c.execute("SELECT * FROM comment_votes")
+    comment_votes_rows = [dict(r) for r in c.fetchall() if r['comment_id'] in comment_ids_set]
+
+    # 6. Share Links
+    c.execute("SELECT * FROM share_links WHERE created_by = ?", (user['email'],))
+    share_links_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
+    
+    # 7. Collections
+    c.execute("SELECT * FROM collections WHERE user_email = ?", (user['email'],))
+    collections_rows = [dict(r) for r in c.fetchall()]
+    collection_ids_set = set(r['id'] for r in collections_rows)
+    
+    # 8. Collection Prompts
+    c.execute("SELECT * FROM collection_prompts")
+    collection_prompts_rows = [dict(r) for r in c.fetchall() if r['collection_id'] in collection_ids_set]
     
     conn.close()
     
     export_payload = {
         "prompts": prompts_rows,
-        "history": history_rows
+        "history": history_rows,
+        "favorites": favorites_rows,
+        "collections": collections_rows,
+        "collection_prompts": collection_prompts_rows,
+        "comments": comments_rows,
+        "comment_votes": comment_votes_rows,
+        "share_links": share_links_rows
     }
 
     if format == "json":
@@ -1081,7 +1114,6 @@ def export_data(format: str, request: Request):
             zip_file.writestr("backup.json", json.dumps(export_payload, indent=2))
             
             images_added = set()
-            
             for row in prompts_rows + history_rows:
                 try:
                     imgs = json.loads(row['image_path'])
@@ -1149,12 +1181,10 @@ async def import_data(request: Request, file: UploadFile = File(...)):
     c = conn.cursor()
     added_prompts = 0
     added_history = 0
-    
-    prompts_to_insert = data_payload.get("prompts", [])
-    history_to_insert = data_payload.get("history", [])
     id_map = {} 
     
-    for row in prompts_to_insert:
+    # 1. Prompts
+    for row in data_payload.get("prompts", []):
         prompt_text = str(row.get("prompt", "")).strip()
         if not prompt_text: continue
         
@@ -1187,7 +1217,8 @@ async def import_data(request: Request, file: UploadFile = File(...)):
                   (new_id, title, prompt_text, author, tags, image_path, user_email, is_shared, copy_count, forked_from))
         added_prompts += 1
         
-    for h_row in history_to_insert:
+    # 2. History
+    for h_row in data_payload.get("history", []):
         old_prompt_id = h_row.get("prompt_id")
         new_prompt_id = id_map.get(old_prompt_id)
         if not new_prompt_id: continue 
@@ -1202,6 +1233,69 @@ async def import_data(request: Request, file: UploadFile = File(...)):
                   (hid, new_prompt_id, h_row.get("title"), h_row.get("prompt"), h_row.get("author"), 
                    h_row.get("tags"), h_row.get("image_path"), h_row.get("edited_by"), h_row.get("edited_at")))
         added_history += 1
+        
+    # 3. Favorites
+    for fav in data_payload.get("favorites", []):
+        p_id = id_map.get(fav.get("prompt_id"))
+        if p_id:
+            c.execute("INSERT OR IGNORE INTO favorites (user_email, prompt_id) VALUES (?, ?)", (user['email'], p_id))
+            
+    # 4. Collections
+    col_id_map = {}
+    for col in data_payload.get("collections", []):
+        old_cid = col.get("id")
+        if not old_cid: continue
+        c_name = col.get("name", "Imported Collection")
+        c.execute("SELECT id FROM collections WHERE name = ? AND user_email = ?", (c_name, user['email']))
+        existing_c = c.fetchone()
+        if existing_c:
+            col_id_map[old_cid] = existing_c[0]
+        else:
+            new_cid = str(uuid.uuid4())
+            col_id_map[old_cid] = new_cid
+            c.execute("INSERT INTO collections (id, name, user_email, created_at) VALUES (?, ?, ?, ?)",
+                      (new_cid, c_name, user['email'], col.get('created_at')))
+
+    # 5. Collection Prompts
+    for cp in data_payload.get("collection_prompts", []):
+        c_id = col_id_map.get(cp.get("collection_id"))
+        p_id = id_map.get(cp.get("prompt_id"))
+        if c_id and p_id:
+            c.execute("INSERT OR IGNORE INTO collection_prompts (collection_id, prompt_id) VALUES (?, ?)", (c_id, p_id))
+
+    # 6. Share Links
+    for sl in data_payload.get("share_links", []):
+        p_id = id_map.get(sl.get("prompt_id"))
+        if p_id:
+            c.execute("INSERT OR IGNORE INTO share_links (token, prompt_id, created_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+                      (sl.get('token'), p_id, user['email'], sl.get('expires_at'), sl.get('created_at')))
+
+    # 7. Comments
+    comment_id_map = {}
+    for cmt in data_payload.get("comments", []):
+        p_id = id_map.get(cmt.get("prompt_id"))
+        if not p_id: continue
+        old_cmt_id = cmt.get("id")
+        if not old_cmt_id: continue
+        
+        c.execute("SELECT id FROM comments WHERE id = ?", (old_cmt_id,))
+        if c.fetchone():
+            comment_id_map[old_cmt_id] = old_cmt_id 
+            continue
+            
+        new_cmt_id = old_cmt_id
+        comment_id_map[old_cmt_id] = new_cmt_id
+        
+        c.execute("""INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body, created_at) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (new_cmt_id, p_id, cmt.get('parent_id'), cmt.get('author_email'), cmt.get('author_name'), cmt.get('body'), cmt.get('created_at')))
+
+    # 8. Comment Votes
+    for cv in data_payload.get("comment_votes", []):
+        cmt_id = comment_id_map.get(cv.get("comment_id"), cv.get("comment_id"))
+        if cmt_id:
+            c.execute("INSERT OR REPLACE INTO comment_votes (comment_id, user_email, vote_type) VALUES (?, ?, ?)",
+                      (cmt_id, user['email'], cv.get('vote_type', 0)))
         
     conn.commit()
     conn.close()
@@ -2885,7 +2979,7 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach((img, idx) => {
-                        carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                        carouselHtml += `<img src="/images/${img}" onclick="if(!isBulkMode) openLightbox('${p.id}', ${idx})" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
