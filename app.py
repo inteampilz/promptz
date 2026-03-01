@@ -109,10 +109,28 @@ def init_db():
     conn.close()
 
 init_db()
+admin_group = os.getenv("OIDC_ADMIN_GROUP", "admin").lower()
 
-def is_admin(user: dict) -> bool:
-    if not user:
-        return False
+def has_admin(val):
+    if isinstance(val, str):
+        return val.lower() == admin_group or admin_group in [v.strip().lower() for v in val.split(',')]
+    if isinstance(val, list):
+        return any(str(r).lower() == admin_group for r in val)
+    return False
+
+for key in ['roles', 'groups', 'Roles', 'Groups', 'role', 'Role']:
+    if has_admin(user.get(key)):
+        return True
+        
+realm_access = user.get('realm_access', {})
+if isinstance(realm_access, dict) and has_admin(realm_access.get('roles')):
+    return True
+        
+admin_emails = [e.strip().lower() for e in os.getenv('ADMIN_EMAILS', '').split(',') if e.strip()]
+if user.get('email', '').lower() in admin_emails:
+    return True
+    
+return False
     
     # Helper to check if "admin" is inside a string (or comma-separated string) or a list
     def has_admin(val):
