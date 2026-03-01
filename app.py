@@ -1570,10 +1570,6 @@ def get_html(request: Request):
                 <button onclick="clearCollectionFilter()" class="text-teal-400 hover:text-white transition-colors font-bold text-lg leading-none">✕</button>
             </div>
 
-            <div class="md:hidden text-center mb-4">
-                <span id="promptCounterMobile" class="text-yellow-400 font-bold text-sm bg-gray-800 px-3 py-1 rounded border border-gray-700">0 Prompts</span>
-            </div>
-
             <div id="gallery" class="grid grid-cols-1 gap-4 md:gap-6 relative z-10"></div>
             
             <div id="loadingIndicator" class="hidden text-center py-8 text-gray-400">
