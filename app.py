@@ -53,7 +53,6 @@ def init_db():
                  (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, author TEXT, tags TEXT, 
                   image_path TEXT, user_email TEXT, is_shared INTEGER)''')
     
-    # DB Schema Migrations for Prompts
     c.execute("PRAGMA table_info(prompts)")
     columns = [col[1] for col in c.fetchall()]
     if 'copy_count' not in columns:
@@ -91,7 +90,6 @@ def init_db():
                  author_email TEXT, author_name TEXT, body TEXT,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
-    # DB Schema Migrations for Comments (Fixes ALL missing columns)
     c.execute("PRAGMA table_info(comments)")
     comment_cols = [col[1] for col in c.fetchall()]
     if comment_cols:
@@ -790,7 +788,6 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
                 raise HTTPException(status_code=404, detail="Parent comment not found.")
 
         comment_id = str(uuid.uuid4())
-        
         author_name = str(user.get('name') or user.get('preferred_username') or user_email)
         
         c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
@@ -800,6 +797,8 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
 
         prompt_title = str(prompt_row['title'] or 'Untitled')
         commenter = author_name
+        base_url = str(request.base_url).rstrip('/')
+        prompt_link = f"{base_url}/?open_comments={prompt_id}"
 
         if parent_row and parent_row['author_email'] and parent_row['author_email'] != user_email:
             notify_to = str(parent_row['author_email'])
@@ -808,7 +807,7 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
                          f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
                          f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
                          f'{html_mod.escape(str(body))}</blockquote>'
-                         f'<p>Log in to NanoBanana Prompts to view the full thread.</p>')
+                         f'<p><a href="{prompt_link}" style="display:inline-block;padding:10px 15px;background:#eab308;color:#000;text-decoration:none;border-radius:5px;font-weight:bold;margin-top:10px;">View Reply</a></p>')
             
             background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
             
@@ -819,7 +818,7 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
                          f'<b>"{html_mod.escape(prompt_title)}"</b>:</p>'
                          f'<blockquote style="border-left:3px solid #f59e0b;padding-left:12px;color:#aaa">'
                          f'{html_mod.escape(str(body))}</blockquote>'
-                         f'<p>Log in to NanoBanana Prompts to view and reply.</p>')
+                         f'<p><a href="{prompt_link}" style="display:inline-block;padding:10px 15px;background:#eab308;color:#000;text-decoration:none;border-radius:5px;font-weight:bold;margin-top:10px;">View Comment</a></p>')
                          
             background_tasks.add_task(_send_email_sync, notify_to, subject, html_body)
 
@@ -1340,7 +1339,6 @@ def get_html(request: Request):
             .hide-scrollbar::-webkit-scrollbar { display: none; }
             .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
             
-            /* Styles für Custom Checkboxes im Bulk Mode */
             .bulk-checkbox-container input[type="checkbox"] {
                 appearance: none;
                 background-color: #374151;
@@ -1362,7 +1360,7 @@ def get_html(request: Request):
                 clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
             }
             .bulk-checkbox-container input[type="checkbox"]:checked {
-                background-color: #a855f7; /* Purple-500 */
+                background-color: #a855f7;
                 border-color: #a855f7;
             }
             .bulk-checkbox-container input[type="checkbox"]:checked::before { transform: scale(1); }
@@ -1491,7 +1489,9 @@ def get_html(request: Request):
 
         <div id="lightboxModal" class="hidden fixed inset-0 z-[100] bg-black/95 flex items-center justify-center p-4" onclick="closeLightbox()">
             <button onclick="closeLightbox()" class="absolute top-4 right-6 text-gray-300 hover:text-yellow-400 text-4xl font-bold z-50 transition-colors focus:outline-none">✕</button>
+            <button id="lightboxPrevBtn" onclick="lightboxNavigate(-1, event)" class="absolute left-4 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-black/80 rounded-full w-12 h-12 flex items-center justify-center text-2xl font-bold z-50 transition-colors focus:outline-none hidden">◀</button>
             <img id="lightboxImg" src="" class="max-w-full max-h-full object-contain shadow-2xl rounded" onclick="event.stopPropagation()">
+            <button id="lightboxNextBtn" onclick="lightboxNavigate(1, event)" class="absolute right-4 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-black/80 rounded-full w-12 h-12 flex items-center justify-center text-2xl font-bold z-50 transition-colors focus:outline-none hidden">▶</button>
         </div>
 
         <div id="exportModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
@@ -1990,13 +1990,59 @@ def get_html(request: Request):
                 }, 1000);
             }
 
-            function openLightbox(src) {
-                document.getElementById('lightboxImg').src = src;
+            // --- LIGHTBOX CAROUSEL ---
+            let currentLightboxImages = [];
+            let currentLightboxIndex = 0;
+
+            function openLightbox(promptId, index = 0) {
+                const p = globalPrompts.find(x => x.id === promptId);
+                if (!p) return;
+                currentLightboxImages = parseImages(p.image_path);
+                currentLightboxIndex = index;
+                
+                updateLightboxImage();
                 document.getElementById('lightboxModal').classList.remove('hidden');
+                
+                document.addEventListener('keydown', lightboxKeyHandler);
             }
+
+            function updateLightboxImage() {
+                if (currentLightboxImages.length === 0) return;
+                document.getElementById('lightboxImg').src = '/images/' + currentLightboxImages[currentLightboxIndex];
+                
+                const prevBtn = document.getElementById('lightboxPrevBtn');
+                const nextBtn = document.getElementById('lightboxNextBtn');
+                
+                if (currentLightboxImages.length > 1) {
+                    prevBtn.classList.remove('hidden');
+                    nextBtn.classList.remove('hidden');
+                } else {
+                    prevBtn.classList.add('hidden');
+                    nextBtn.classList.add('hidden');
+                }
+            }
+
+            function lightboxNavigate(direction, event) {
+                if(event) event.stopPropagation();
+                if(currentLightboxImages.length <= 1) return;
+                
+                currentLightboxIndex += direction;
+                if (currentLightboxIndex < 0) currentLightboxIndex = currentLightboxImages.length - 1;
+                if (currentLightboxIndex >= currentLightboxImages.length) currentLightboxIndex = 0;
+                
+                updateLightboxImage();
+            }
+
+            function lightboxKeyHandler(e) {
+                if (e.key === 'ArrowRight') lightboxNavigate(1);
+                else if (e.key === 'ArrowLeft') lightboxNavigate(-1);
+                else if (e.key === 'Escape') closeLightbox();
+            }
+
             function closeLightbox() {
                 document.getElementById('lightboxModal').classList.add('hidden');
                 document.getElementById('lightboxImg').src = '';
+                document.removeEventListener('keydown', lightboxKeyHandler);
             }
 
             function toggleFavFilter() {
@@ -2552,6 +2598,9 @@ def get_html(request: Request):
                 if (showOnlyFavorites) toggleFavFilter();
                 if (activeCollectionId) clearCollectionFilter();
                 window.scrollTo({ top: 0, behavior: 'smooth' });
+                
+                // Clear URL parameters if any exist
+                window.history.replaceState({}, document.title, window.location.pathname);
                 triggerRenderReset();
             }
 
@@ -2589,6 +2638,14 @@ def get_html(request: Request):
 
                 extractAutocompleteData();
                 triggerRenderReset();
+                
+                // Auto-Open Comments Modal if accessed via Email Link
+                const urlParams = new URLSearchParams(window.location.search);
+                const commentPromptId = urlParams.get('open_comments');
+                if (commentPromptId && globalPrompts.find(p => p.id === commentPromptId)) {
+                    openCommentsModal(commentPromptId);
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                }
             }
 
             function triggerRenderReset() {
@@ -2715,8 +2772,8 @@ def get_html(request: Request):
                     const isMulti = images.length > 1;
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
-                    images.forEach(img => {
-                        carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                    images.forEach((img, idx) => {
+                        carouselHtml += `<img src="/images/${img}" onclick="if(!isBulkMode) openLightbox('${p.id}', ${idx})" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
@@ -2728,8 +2785,7 @@ def get_html(request: Request):
                         `;
                     }
 
-                    const firstImg = images.length > 0 ? images[0] : '';
-                    carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('/images/${firstImg}')" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
+                    carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('${p.id}', 0)" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
                     
                     const favIcon = p.is_favorite ? '❤️' : '🤍';
                     
