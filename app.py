@@ -110,6 +110,30 @@ def init_db():
 
 init_db()
 
+def is_admin(user: dict) -> bool:
+    if not user:
+        return False
+    
+    # 1. Check standard OIDC claims
+    for key in ['roles', 'groups', 'Roles', 'Groups']:
+        val = user.get(key, [])
+        if isinstance(val, list) and any(r.lower() == 'admin' for r in val):
+            return True
+            
+    # 2. Check Keycloak specific nested claims
+    realm_access = user.get('realm_access', {})
+    if isinstance(realm_access, dict):
+        rc_roles = realm_access.get('roles', [])
+        if isinstance(rc_roles, list) and any(r.lower() == 'admin' for r in rc_roles):
+            return True
+            
+    # 3. Fallback: check manually configured admin emails via Env Var
+    admin_emails = [e.strip().lower() for e in os.getenv('ADMIN_EMAILS', '').split(',') if e.strip()]
+    if user.get('email', '').lower() in admin_emails:
+        return True
+        
+    return False
+
 def _send_email_sync(to: str, subject: str, body_html: str):
     if not (SMTP_HOST and SMTP_FROM and to):
         return
@@ -458,9 +482,11 @@ async def delete_prompt(prompt_id: str, request: Request):
     c = conn.cursor()
     c.execute("SELECT user_email FROM prompts WHERE id = ?", (prompt_id,))
     row = c.fetchone()
-    if not row or row[0] != user_email:
+    
+    # Check if user is owner or admin
+    if not row or (row[0] != user_email and not is_admin(user)):
         conn.close()
-        raise HTTPException(status_code=403)
+        raise HTTPException(status_code=403, detail="Not authorized to delete this prompt.")
         
     c.execute("SELECT image_path FROM prompts WHERE id = ?", (prompt_id,))
     cur_img = c.fetchone()
@@ -495,6 +521,7 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     user_email = str(user.get('email', 'unknown'))
+    user_is_admin = is_admin(user)
     
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     
@@ -504,7 +531,8 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
     for pid in ids:
         c.execute("SELECT user_email, image_path FROM prompts WHERE id = ?", (pid,))
         row = c.fetchone()
-        if row and row[0] == user_email: 
+        
+        if row and (row[0] == user_email or user_is_admin): 
             files_to_delete = set()
             if row[1]:
                 try: files_to_delete.update(json.loads(str(row[1])))
@@ -535,6 +563,7 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     user_email = str(user.get('email', 'unknown'))
+    user_is_admin = is_admin(user)
     
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     clean_tag = new_tag.strip()
@@ -546,7 +575,7 @@ async def bulk_tag(request: Request, prompt_ids: str = Form(...), new_tag: str =
     for pid in ids:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
-        if current and (current['user_email'] == user_email or current['is_shared'] == 1):
+        if current and (current['user_email'] == user_email or current['is_shared'] == 1 or user_is_admin):
             tags_str = str(current['tags'] or "")
             current_tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             
@@ -567,6 +596,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     user_email = str(user.get('email', 'unknown'))
+    user_is_admin = is_admin(user)
     
     ids = [i.strip() for i in prompt_ids.split(',') if i.strip()]
     if not ids: return {"status": "success"}
@@ -580,7 +610,7 @@ async def bulk_auto_tag(request: Request, prompt_ids: str = Form(...), language:
         c.execute("SELECT * FROM prompts WHERE id = ?", (pid,))
         current = c.fetchone()
         
-        if current and (current['user_email'] == user_email or current['is_shared'] == 1) and current['prompt']:
+        if current and (current['user_email'] == user_email or current['is_shared'] == 1 or user_is_admin) and current['prompt']:
             prompt_text = str(current['prompt'])
             instruction = f"""
             Analyze this prompt for AI image generation and create 3 to 6 relevant, short tags (e.g., 3d, cyberpunk, portrait).
@@ -864,9 +894,11 @@ async def delete_comment(comment_id: str, request: Request):
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Comment not found.")
-    if row[0] != user_email:
+        
+    if row[0] != user_email and not is_admin(user):
         conn.close()
-        raise HTTPException(status_code=403, detail="Not your comment.")
+        raise HTTPException(status_code=403, detail="Not authorized.")
+        
     c.execute("DELETE FROM comments WHERE id = ? OR parent_id = ?", (comment_id, comment_id))
     c.execute("DELETE FROM comment_votes WHERE comment_id = ?", (comment_id,))
     conn.commit()
@@ -1318,6 +1350,8 @@ def get_html(request: Request):
         <a href="/login" class="bg-yellow-500 hover:bg-yellow-600 text-black font-bold py-3 px-8 rounded">Login via OIDC</a>
         </div></body></html>"""
 
+    admin_badge = '<span class="text-red-400 font-bold text-xs ml-2 border border-red-400 px-1 rounded align-middle" title="Admin Privileges Active">ADMIN</span>' if is_admin(user) else ''
+
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
@@ -1376,7 +1410,7 @@ def get_html(request: Request):
                     <span id="promptCounter" class="bg-gray-800 text-yellow-400 font-bold px-3 py-1 rounded border border-gray-700 text-sm">
                         0 Prompts
                     </span>
-                    <span class="text-gray-400 text-sm hidden md:inline">__USER_EMAIL__</span>
+                    <span class="text-gray-400 text-sm hidden md:inline">__USER_EMAIL__ __ADMIN_BADGE__</span>
                     <a href="/logout" class="text-red-400 hover:text-red-300 text-sm border border-red-400 hover:border-red-300 rounded px-3 py-1">Logout</a>
                 </div>
             </div>
@@ -1490,7 +1524,7 @@ def get_html(request: Request):
         <div id="lightboxModal" class="hidden fixed inset-0 z-[100] bg-black/95 flex items-center justify-center p-4" onclick="closeLightbox()">
             <button onclick="closeLightbox()" class="absolute top-4 right-6 text-gray-300 hover:text-yellow-400 text-4xl font-bold z-50 transition-colors focus:outline-none">✕</button>
             <button id="lightboxPrevBtn" onclick="lightboxNavigate(-1, event)" class="absolute left-4 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-black/80 rounded-full w-12 h-12 flex items-center justify-center text-2xl font-bold z-50 transition-colors focus:outline-none hidden">◀</button>
-            <img id="lightboxImg" src="" class="max-w-full max-h-full object-contain shadow-2xl rounded" onclick="event.stopPropagation()">
+            <img id="lightboxImg" src="" class="max-w-full max-h-full object-contain shadow-2xl rounded select-none" onclick="event.stopPropagation()">
             <button id="lightboxNextBtn" onclick="lightboxNavigate(1, event)" class="absolute right-4 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-black/80 rounded-full w-12 h-12 flex items-center justify-center text-2xl font-bold z-50 transition-colors focus:outline-none hidden">▶</button>
         </div>
 
@@ -1746,6 +1780,8 @@ def get_html(request: Request):
 
             let collections = [];
             let activeCollectionId = null;
+            
+            const IS_ADMIN = __IS_ADMIN__;
 
             function escapeHTML(str) {
                 if (!str) return '';
@@ -1990,9 +2026,33 @@ def get_html(request: Request):
                 }, 1000);
             }
 
-            // --- LIGHTBOX CAROUSEL ---
+            // --- LIGHTBOX CAROUSEL WITH TOUCH ---
             let currentLightboxImages = [];
             let currentLightboxIndex = 0;
+            let touchstartX = 0;
+            let touchendX = 0;
+
+            const lightboxModal = document.getElementById('lightboxModal');
+
+            lightboxModal.addEventListener('touchstart', e => {
+                touchstartX = e.changedTouches[0].screenX;
+            }, {passive: true});
+
+            lightboxModal.addEventListener('touchend', e => {
+                touchendX = e.changedTouches[0].screenX;
+                handleLightboxSwipe();
+            }, {passive: true});
+
+            function handleLightboxSwipe() {
+                if (currentLightboxImages.length <= 1) return;
+                const threshold = 40;
+                if (touchendX < touchstartX - threshold) {
+                    lightboxNavigate(1);
+                }
+                if (touchendX > touchstartX + threshold) {
+                    lightboxNavigate(-1);
+                }
+            }
 
             function openLightbox(promptId, index = 0) {
                 const p = globalPrompts.find(x => x.id === promptId);
@@ -2452,7 +2512,7 @@ def get_html(request: Request):
                 const dvClass    = c.user_downvoted
                     ? 'text-red-400'
                     : 'text-gray-500 hover:text-red-400';
-                const deleteBtn  = c.is_mine
+                const deleteBtn  = (c.is_mine || IS_ADMIN)
                     ? `<button onclick="deleteComment('${c.id}')" class="text-xs text-gray-600 hover:text-red-400 transition-colors" title="Delete">🗑</button>`
                     : '';
                 const replyBtn   = isReply ? '' :
@@ -2599,7 +2659,6 @@ def get_html(request: Request):
                 if (activeCollectionId) clearCollectionFilter();
                 window.scrollTo({ top: 0, behavior: 'smooth' });
                 
-                // Clear URL parameters if any exist
                 window.history.replaceState({}, document.title, window.location.pathname);
                 triggerRenderReset();
             }
@@ -2639,7 +2698,6 @@ def get_html(request: Request):
                 extractAutocompleteData();
                 triggerRenderReset();
                 
-                // Auto-Open Comments Modal if accessed via Email Link
                 const urlParams = new URLSearchParams(window.location.search);
                 const commentPromptId = urlParams.get('open_comments');
                 if (commentPromptId && globalPrompts.find(p => p.id === commentPromptId)) {
@@ -2751,7 +2809,7 @@ def get_html(request: Request):
                                        : '<span class="bg-gray-900 text-white text-xs px-2 py-1 rounded shadow border border-gray-700">Private</span>')
                         : '<span class="bg-green-600 text-white text-xs px-2 py-1 rounded shadow truncate max-w-full inline-block">Shared by ' + escapeHTML(p.user_email) + '</span>';
 
-                    const deleteBtn = p.is_mine ? `<button onclick="deletePrompt('${p.id}')" class="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-1 px-2 rounded text-sm transition-colors border border-red-800">Delete</button>` : '';
+                    const deleteBtn = (p.is_mine || IS_ADMIN) ? `<button onclick="deletePrompt('${p.id}')" class="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-1 px-2 rounded text-sm transition-colors border border-red-800">Delete</button>` : '';
 
                     let actionButtons = `
                         <div class="flex flex-wrap gap-2 mt-2">
@@ -2785,6 +2843,7 @@ def get_html(request: Request):
                         `;
                     }
 
+                    const firstImg = images.length > 0 ? images[0] : '';
                     carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('${p.id}', 0)" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
                     
                     const favIcon = p.is_favorite ? '❤️' : '🤍';
@@ -3451,4 +3510,12 @@ def get_html(request: Request):
     </body>
     </html>
     """
-    return html_template.replace("__USER_EMAIL__", user.get('email', 'User'))
+    
+    admin_badge = '<span class="text-red-400 font-bold text-xs ml-1 border border-red-400 px-1 rounded" title="Admin Privileges Active">ADMIN</span>' if is_admin(user) else ''
+    is_adm_str = "true" if is_admin(user) else "false"
+    
+    html = html_template.replace("__USER_EMAIL__", user.get('email', 'User'))
+    html = html.replace("__ADMIN_BADGE__", admin_badge)
+    html = html.replace("__IS_ADMIN__", is_adm_str)
+    
+    return html
