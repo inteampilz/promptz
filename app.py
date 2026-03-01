@@ -2979,7 +2979,7 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach((img, idx) => {
-                        carouselHtml += `<img src="/images/${img}" onclick="if(!isBulkMode) openLightbox('${p.id}', ${idx})" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                   carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
