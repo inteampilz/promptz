@@ -105,6 +105,11 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS comment_votes
                  (comment_id TEXT, user_email TEXT, UNIQUE(comment_id, user_email))''')
 
+    c.execute("PRAGMA table_info(comment_votes)")
+    cv_cols = [col[1] for col in c.fetchall()]
+    if cv_cols and 'vote_type' not in cv_cols:
+        c.execute("ALTER TABLE comment_votes ADD COLUMN vote_type INTEGER DEFAULT -1")
+
     conn.commit()
     conn.close()
 
@@ -486,7 +491,6 @@ async def delete_prompt(prompt_id: str, request: Request):
     c.execute("SELECT user_email FROM prompts WHERE id = ?", (prompt_id,))
     row = c.fetchone()
     
-    # Check if user is owner or admin
     if not row or (row[0] != user_email and not is_admin(user)):
         conn.close()
         raise HTTPException(status_code=403, detail="Not authorized to delete this prompt.")
@@ -761,12 +765,10 @@ async def get_comments(prompt_id: str, request: Request):
     c = conn.cursor()
     c.execute("""
         SELECT c.*,
-               COUNT(v.comment_id) as downvote_count,
-               MAX(CASE WHEN v.user_email = ? THEN 1 ELSE 0 END) as user_downvoted
+               COALESCE((SELECT SUM(vote_type) FROM comment_votes WHERE comment_id = c.id), 0) as net_score,
+               COALESCE((SELECT vote_type FROM comment_votes WHERE comment_id = c.id AND user_email = ?), 0) as user_vote
         FROM comments c
-        LEFT JOIN comment_votes v ON c.id = v.comment_id
         WHERE c.prompt_id = ?
-        GROUP BY c.id
         ORDER BY c.created_at ASC
     """, (user_email, prompt_id))
     rows = [dict(r) for r in c.fetchall()]
@@ -781,10 +783,10 @@ async def get_comments(prompt_id: str, request: Request):
     for row in top_level:
         row['replies'] = replies_map.get(row['id'], [])
         row['is_mine'] = (row['author_email'] == user_email)
-        row['user_downvoted'] = bool(row['user_downvoted'])
+        row['user_vote'] = int(row['user_vote'])
         for reply in row['replies']:
             reply['is_mine'] = (reply['author_email'] == user_email)
-            reply['user_downvoted'] = bool(reply['user_downvoted'])
+            reply['user_vote'] = int(reply['user_vote'])
             reply['replies'] = []
     return top_level
 
@@ -821,6 +823,7 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
                 raise HTTPException(status_code=404, detail="Parent comment not found.")
 
         comment_id = str(uuid.uuid4())
+        
         author_name = str(user.get('name') or user.get('preferred_username') or user_email)
         
         c.execute("INSERT INTO comments (id, prompt_id, parent_id, author_email, author_name, body) VALUES (?, ?, ?, ?, ?, ?)",
@@ -862,27 +865,28 @@ async def add_comment(prompt_id: str, request: Request, background_tasks: Backgr
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
-@app.post("/api/comments/{comment_id}/downvote")
-async def toggle_downvote(comment_id: str, request: Request):
+@app.post("/api/comments/{comment_id}/vote")
+async def vote_comment(comment_id: str, request: Request, vote: int = Form(...)):
     user = request.session.get('user')
     if not user: raise HTTPException(status_code=401)
     user_email = str(user.get('email', 'unknown'))
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT 1 FROM comment_votes WHERE comment_id = ? AND user_email = ?",
-              (comment_id, user_email))
-    if c.fetchone():
-        c.execute("DELETE FROM comment_votes WHERE comment_id = ? AND user_email = ?",
-                  (comment_id, user_email))
-        voted = False
+    
+    if vote == 0:
+        c.execute("DELETE FROM comment_votes WHERE comment_id = ? AND user_email = ?", (comment_id, user_email))
     else:
-        c.execute("INSERT INTO comment_votes (comment_id, user_email) VALUES (?, ?)",
-                  (comment_id, user_email))
-        voted = True
+        c.execute("INSERT OR REPLACE INTO comment_votes (comment_id, user_email, vote_type) VALUES (?, ?, ?)", 
+                  (comment_id, user_email, vote))
+    
     conn.commit()
+    
+    c.execute("SELECT COALESCE(SUM(vote_type), 0) FROM comment_votes WHERE comment_id = ?", (comment_id,))
+    net_score = c.fetchone()[0]
     conn.close()
-    return {"downvoted": voted}
+    
+    return {"net_score": net_score, "user_vote": vote}
 
 @app.delete("/api/comments/{comment_id}")
 async def delete_comment(comment_id: str, request: Request):
@@ -1354,6 +1358,7 @@ def get_html(request: Request):
         </div></body></html>"""
 
     admin_badge = '<span class="text-red-400 font-bold text-xs ml-2 border border-red-400 px-1 rounded align-middle" title="Admin Privileges Active">ADMIN</span>' if is_admin(user) else ''
+    is_adm_str = "true" if is_admin(user) else "false"
 
     html_template = """
     <!DOCTYPE html>
@@ -1780,6 +1785,7 @@ def get_html(request: Request):
             
             let isBulkMode = false;
             let selectedPrompts = new Set();
+            let lastCheckedId = null;
 
             let collections = [];
             let activeCollectionId = null;
@@ -1806,6 +1812,7 @@ def get_html(request: Request):
             function toggleBulkMode() {
                 isBulkMode = !isBulkMode;
                 selectedPrompts.clear();
+                lastCheckedId = null;
                 
                 const btn = document.getElementById('bulkModeBtn');
                 const bar = document.getElementById('bulkActionBar');
@@ -1829,11 +1836,46 @@ def get_html(request: Request):
                 updateBulkCount();
             }
 
-            function toggleBulkSelection(id, isChecked) {
-                if (isChecked) selectedPrompts.add(id);
-                else selectedPrompts.delete(id);
+            function handleBulkCheckboxClick(id, event) {
+                const isChecked = event.target.checked;
+                
+                if (event.shiftKey && lastCheckedId) {
+                    const start = displayPrompts.findIndex(p => p.id === lastCheckedId);
+                    const end = displayPrompts.findIndex(p => p.id === id);
+                    
+                    if (start !== -1 && end !== -1) {
+                        const min = Math.min(start, end);
+                        const max = Math.max(start, end);
+                        
+                        for (let i = min; i <= max; i++) {
+                            const pid = displayPrompts[i].id;
+                            if (isChecked) {
+                                selectedPrompts.add(pid);
+                            } else {
+                                selectedPrompts.delete(pid);
+                            }
+                            const cb = document.querySelector(`#card-${pid} input[type="checkbox"]`);
+                            if (cb) cb.checked = isChecked;
+                        }
+                    }
+                } else {
+                    if (isChecked) selectedPrompts.add(id);
+                    else selectedPrompts.delete(id);
+                }
+                
+                lastCheckedId = id;
                 updateBulkCount();
                 updateSelectAllButtonState();
+            }
+
+            function handleCardClick(id, event) {
+                const card = document.getElementById('card-' + id);
+                if (!card) return;
+                const cb = card.querySelector('input[type="checkbox"]');
+                if (cb) {
+                    cb.checked = !cb.checked;
+                    handleBulkCheckboxClick(id, { target: cb, shiftKey: event.shiftKey });
+                }
             }
 
             function updateBulkCount() {
@@ -2512,11 +2554,13 @@ def get_html(request: Request):
                 const safeBody   = escapeHTML(c.body);
                 const safeAuthor = escapeHTML(c.author_name || c.author_email);
                 const date       = new Date(c.created_at + 'Z').toLocaleString();
-                const dvClass    = c.user_downvoted
-                    ? 'text-red-400'
-                    : 'text-gray-500 hover:text-red-400';
+                
+                const uVote      = c.user_vote || 0;
+                const upClass    = uVote === 1 ? 'text-green-400' : 'text-gray-500 hover:text-green-400';
+                const downClass  = uVote === -1 ? 'text-red-400' : 'text-gray-500 hover:text-red-400';
+                
                 const deleteBtn  = (c.is_mine || IS_ADMIN)
-                    ? `<button onclick="deleteComment('${c.id}')" class="text-xs text-gray-600 hover:text-red-400 transition-colors" title="Delete">🗑</button>`
+                    ? `<button onclick="deleteComment('${c.id}')" class="text-xs text-gray-600 hover:text-red-400 transition-colors ml-2" title="Delete">🗑</button>`
                     : '';
                 const replyBtn   = isReply ? '' :
                     `<button onclick="toggleReplyForm('${c.id}')" class="text-xs text-gray-500 hover:text-yellow-400 transition-colors">↩ Reply</button>`;
@@ -2543,12 +2587,10 @@ def get_html(request: Request):
                             <span class="text-xs text-gray-500 ml-2">${date}</span>
                             <p class="text-sm text-gray-200 mt-1 break-words">${safeBody}</p>
                         </div>
-                        <div class="flex items-center gap-1 flex-shrink-0">
-                            <button onclick="downvoteComment('${c.id}', this)"
-                                class="text-xs ${dvClass} transition-colors flex items-center gap-0.5"
-                                title="Downvote" id="dv-btn-${c.id}">
-                                👎 <span id="dv-count-${c.id}">${c.downvote_count || 0}</span>
-                            </button>
+                        <div class="flex items-center gap-2 flex-shrink-0 bg-gray-800 rounded px-2 py-1">
+                            <button onclick="voteComment('${c.id}', 1)" class="text-xs ${upClass} transition-colors" id="up-btn-${c.id}">▲</button>
+                            <span class="text-xs font-bold text-gray-300 min-w-[12px] text-center" id="score-${c.id}">${c.net_score || 0}</span>
+                            <button onclick="voteComment('${c.id}', -1)" class="text-xs ${downClass} transition-colors" id="down-btn-${c.id}">▼</button>
                             ${deleteBtn}
                         </div>
                     </div>
@@ -2595,20 +2637,29 @@ def get_html(request: Request):
                 }
             }
 
-            async function downvoteComment(commentId, btn) {
-                const res = await fetch(`/api/comments/${commentId}/downvote`, { method: 'POST' });
+            async function voteComment(commentId, clickedVote) {
+                const upBtn = document.getElementById('up-btn-' + commentId);
+                const downBtn = document.getElementById('down-btn-' + commentId);
+                
+                let currentVote = 0;
+                if (upBtn.classList.contains('text-green-400')) currentVote = 1;
+                else if (downBtn.classList.contains('text-red-400')) currentVote = -1;
+                
+                let finalVote = clickedVote;
+                if (currentVote === clickedVote) {
+                    finalVote = 0; 
+                }
+                
+                const formData = new FormData();
+                formData.append('vote', finalVote);
+                const res = await fetch(`/api/comments/${commentId}/vote`, { method: 'POST', body: formData });
                 if (!res.ok) return;
                 const data = await res.json();
-                const countEl = document.getElementById('dv-count-' + commentId);
-                if (countEl) {
-                    const cur = parseInt(countEl.textContent) || 0;
-                    countEl.textContent = data.downvoted ? cur + 1 : Math.max(0, cur - 1);
-                }
-                btn.className = btn.className
-                    .replace('text-red-400', '')
-                    .replace('text-gray-500 hover:text-red-400', '')
-                    .trim()
-                    + ' ' + (data.downvoted ? 'text-red-400' : 'text-gray-500 hover:text-red-400');
+                
+                document.getElementById('score-' + commentId).textContent = data.net_score;
+                
+                upBtn.className = "text-xs transition-colors " + (data.user_vote === 1 ? "text-green-400" : "text-gray-500 hover:text-green-400");
+                downBtn.className = "text-xs transition-colors " + (data.user_vote === -1 ? "text-red-400" : "text-gray-500 hover:text-red-400");
             }
 
             async function deleteComment(commentId) {
@@ -2846,7 +2897,6 @@ def get_html(request: Request):
                         `;
                     }
 
-                    const firstImg = images.length > 0 ? images[0] : '';
                     carouselHtml += `<button onclick="event.stopPropagation(); openLightbox('${p.id}', 0)" class="absolute bottom-2 left-2 bg-black/60 hover:bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover/carousel:opacity-100 transition-opacity z-10 focus:outline-none" title="Open fullscreen">⤢</button>`;
                     
                     const favIcon = p.is_favorite ? '❤️' : '🤍';
@@ -2874,7 +2924,7 @@ def get_html(request: Request):
                     const bulkCheckboxHtml = `
                         <div class="absolute top-2 left-2 z-20 bulk-checkbox-container" style="display: ${isBulkMode ? 'block' : 'none'};">
                             <input type="checkbox" class="w-6 h-6 rounded border-gray-600 cursor-pointer shadow-lg outline-none ring-2 ring-purple-500 ring-offset-2 ring-offset-gray-800" 
-                                   onchange="toggleBulkSelection('${p.id}', this.checked)" 
+                                   onclick="handleBulkCheckboxClick('${p.id}', event)" 
                                    ${selectedPrompts.has(p.id) ? 'checked' : ''}>
                         </div>
                     `;
@@ -2892,7 +2942,7 @@ def get_html(request: Request):
                         <div class="bg-gray-800 rounded-lg overflow-hidden border ${selectedPrompts.has(p.id) ? 'border-purple-500' : 'border-gray-700'} shadow-lg flex flex-col relative group transition-colors" id="card-${p.id}">
                             ${bulkCheckboxHtml}
 
-                            <div class="relative w-full aspect-square overflow-hidden group/carousel" onclick="if(isBulkMode){ const cb = this.previousElementSibling.querySelector('input'); cb.checked = !cb.checked; toggleBulkSelection('${p.id}', cb.checked); } else { toggleCardDetails('${p.id}'); }">
+                            <div class="relative w-full aspect-square overflow-hidden group/carousel" onclick="if(isBulkMode){ handleCardClick('${p.id}', event); } else { toggleCardDetails('${p.id}'); }">
                                 ${carouselHtml}
                             </div>
 
