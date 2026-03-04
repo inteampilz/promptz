@@ -12,6 +12,7 @@ from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException, Bac
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
+from starlette_csrf import CSRFMiddleware
 from authlib.integrations.starlette_client import OAuth
 from PIL import Image
 from google import genai
@@ -24,6 +25,13 @@ import asyncio
 app = FastAPI()
 
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "super-secret-fallback"))
+app.add_middleware(
+    CSRFMiddleware,
+    secret=os.getenv("CSRF_SECRET", "csrf-super-secret-fallback"),
+    sensitive_cookies={"session"},
+    cookie_name="csrftoken",
+    header_name="x-csrftoken"
+)
 
 oauth = OAuth()
 oauth.register(
@@ -110,6 +118,13 @@ def init_db():
     if cv_cols and 'vote_type' not in cv_cols:
         c.execute("ALTER TABLE comment_votes ADD COLUMN vote_type INTEGER DEFAULT -1")
 
+    # Explicit Database Indexing for Performance
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_user_email ON prompts(user_email)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_is_shared ON prompts(is_shared)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_email)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_history_prompt_id ON prompt_history(prompt_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_comments_prompt_id ON comments(prompt_id)")
+
     conn.commit()
     conn.close()
 
@@ -173,11 +188,21 @@ async def optimize_and_save_image(upload_file: UploadFile) -> str:
         raise HTTPException(status_code=400, detail="Invalid image file format.")
     
     if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-    img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
     
     filename = f"{uuid.uuid4()}.webp"
     file_path = os.path.join(IMG_DIR, filename)
-    img.save(file_path, "webp", quality=80, optimize=True)
+    thumb_path = os.path.join(IMG_DIR, f"thumb_{filename}")
+
+    # Save Full Image
+    full_img = img.copy()
+    full_img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+    full_img.save(file_path, "webp", quality=80, optimize=True)
+
+    # Save Thumbnail
+    thumb_img = img.copy()
+    thumb_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+    thumb_img.save(thumb_path, "webp", quality=70, optimize=True)
+    
     return filename
 
 def extract_metadata_from_image(image_bytes: bytes) -> str:
@@ -513,7 +538,9 @@ async def delete_prompt(prompt_id: str, request: Request):
         usage_count = c.fetchone()[0]
         if usage_count <= 1:
             fp = os.path.join(IMG_DIR, f)
+            thumb_fp = os.path.join(IMG_DIR, f"thumb_{f}")
             if os.path.exists(fp): os.remove(fp)
+            if os.path.exists(thumb_fp): os.remove(thumb_fp)
 
     c.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
     c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (prompt_id,))
@@ -555,7 +582,9 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
                 usage_count = c.fetchone()[0]
                 if usage_count <= 1:
                     fp = os.path.join(IMG_DIR, f)
+                    thumb_fp = os.path.join(IMG_DIR, f"thumb_{f}")
                     if os.path.exists(fp): os.remove(fp)
+                    if os.path.exists(thumb_fp): os.remove(thumb_fp)
 
             c.execute("DELETE FROM prompts WHERE id = ?", (pid,))
             c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (pid,))
@@ -1124,9 +1153,12 @@ def export_data(format: str, request: Request):
                 for img in imgs:
                     if img and img not in images_added:
                         img_full_path = os.path.join(IMG_DIR, img)
+                        thumb_full_path = os.path.join(IMG_DIR, f"thumb_{img}")
                         if os.path.exists(img_full_path):
                             zip_file.write(img_full_path, arcname=f"images/{img}")
-                            images_added.add(img)
+                        if os.path.exists(thumb_full_path):
+                            zip_file.write(thumb_full_path, arcname=f"images/thumb_{img}")
+                        images_added.add(img)
                             
         return Response(content=zip_buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=nanobanana_full_backup.zip"})
         
@@ -1358,7 +1390,7 @@ def view_shared_prompt(token: str):
     safe_title  = html_mod.escape(str(prompt['title'] or 'Untitled'))
     safe_author = html_mod.escape(str(prompt['author'] or 'Unknown'))
     tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(str(t))}</span>' for t in tags)
-    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-cover aspect-square">' for img in images)
+    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-cover aspect-square" loading="lazy">' for img in images)
     
     prompt_str  = str(prompt['prompt'] or '')
     prompt_js   = json.dumps(prompt_str).replace("</", "<\\/")
@@ -1462,6 +1494,7 @@ def get_html(request: Request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>NanoBanana Prompts</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
         <style>
             #dropZone { transition: all 0.2s ease-in-out; }
             .autocomplete-list::-webkit-scrollbar { width: 6px; }
@@ -1500,6 +1533,7 @@ def get_html(request: Request):
                 border-color: #a855f7;
             }
             .bulk-checkbox-container input[type="checkbox"]:checked::before { transform: scale(1); }
+            .sortable-ghost { opacity: 0.4; }
         </style>
     </head>
     <body class="bg-gray-900 text-white p-4 md:p-6 lg:p-8 font-sans pb-24">
@@ -1710,7 +1744,7 @@ def get_html(request: Request):
                         </div>
                     </div>
                     
-                    <div id="mediaPreviews" class="flex gap-2 overflow-x-auto hide-scrollbar mb-4 py-2"></div>
+                    <div id="mediaPreviews" class="flex gap-2 overflow-x-auto hide-scrollbar mb-4 py-2 cursor-move"></div>
                     
                     <div class="flex items-center mb-6">
                         <input type="checkbox" id="is_shared" name="is_shared" value="true" checked class="w-4 h-4 text-yellow-500 bg-gray-700 border-gray-600 rounded">
@@ -1862,6 +1896,22 @@ def get_html(request: Request):
         </div>
 
         <script>
+            // Utility for CSRF Token fetching
+            function getCsrfToken() {
+                return document.cookie.split('; ').find(row => row.startsWith('csrftoken='))?.split('=')[1] || '';
+            }
+
+            // Wrapping the standard fetch to auto-include CSRF Token for mutating requests
+            const originalFetch = window.fetch;
+            window.fetch = function() {
+                let [resource, config] = arguments;
+                if(config && ['POST', 'PUT', 'DELETE'].includes(config.method)) {
+                    config.headers = config.headers || {};
+                    config.headers['x-csrftoken'] = getCsrfToken();
+                }
+                return originalFetch(resource, config);
+            };
+
             let globalPrompts = [];
             let displayPrompts = [];
             let uniqueAuthors = [];
@@ -1872,6 +1922,7 @@ def get_html(request: Request):
             
             let showOnlyFavorites = false;
             let mediaItems = []; 
+            let sortableMediaInstance = null; // Sortable JS Instance
             
             let isBulkMode = false;
             let selectedPrompts = new Set();
@@ -2448,26 +2499,52 @@ def get_html(request: Request):
                 renderMediaPreviews();
             }
 
+            // Init SortableJS for Drag-and-Drop Image Reordering
+            function initSortableMedia() {
+                const el = document.getElementById('mediaPreviews');
+                if (sortableMediaInstance) sortableMediaInstance.destroy();
+                sortableMediaInstance = Sortable.create(el, {
+                    animation: 150,
+                    ghostClass: 'sortable-ghost',
+                    onEnd: function (evt) {
+                        // Reorder underlying mediaItems Array to match UI
+                        const itemEl = mediaItems.splice(evt.oldIndex, 1)[0];
+                        mediaItems.splice(evt.newIndex, 0, itemEl);
+                        
+                        // Recalculate 'Cover' state (first element is always cover)
+                        mediaItems.forEach(m => m.isCover = false);
+                        if (mediaItems.length > 0) mediaItems[0].isCover = true;
+                        
+                        renderMediaPreviews();
+                    }
+                });
+            }
+
             function renderMediaPreviews() {
                 const container = document.getElementById('mediaPreviews');
                 if (mediaItems.length === 0) { container.innerHTML = ''; return; }
                 container.innerHTML = mediaItems.map((item, index) => `
-                    <div class="relative w-24 h-24 flex-shrink-0 rounded overflow-hidden border-2 transition-colors ${item.isCover ? 'border-yellow-400' : 'border-gray-600'}">
+                    <div class="relative w-24 h-24 flex-shrink-0 rounded overflow-hidden border-2 transition-colors ${item.isCover ? 'border-yellow-400' : 'border-gray-600'} cursor-grab active:cursor-grabbing">
                         <img src="${item.url}" class="w-full h-full object-cover">
                         <div class="absolute top-0 right-0 bg-black/80 flex rounded-bl">
-                            <button type="button" onclick="event.stopPropagation(); setCover(${index})" class="px-2 py-1 hover:text-yellow-400 text-xs transition-colors ${item.isCover ? 'text-yellow-400' : 'text-gray-400'}">⭐</button>
-                            <button type="button" onclick="event.stopPropagation(); removeMedia(${index})" class="px-2 py-1 hover:text-red-500 text-gray-400 text-xs transition-colors">✕</button>
+                            <button type="button" onclick="event.stopPropagation(); setCover(${index})" class="px-2 py-1 hover:text-yellow-400 text-xs transition-colors ${item.isCover ? 'text-yellow-400' : 'text-gray-400'}" title="Make Cover">⭐</button>
+                            <button type="button" onclick="event.stopPropagation(); removeMedia(${index})" class="px-2 py-1 hover:text-red-500 text-gray-400 text-xs transition-colors" title="Remove">✕</button>
                         </div>
-                        ${item.isCover ? '<div class="absolute bottom-0 left-0 right-0 bg-yellow-400 text-black text-[10px] text-center font-bold">COVER</div>' : ''}
+                        ${item.isCover ? '<div class="absolute bottom-0 left-0 right-0 bg-yellow-400 text-black text-[10px] text-center font-bold pointer-events-none">COVER</div>' : ''}
                     </div>
                 `).join('');
+                
+                initSortableMedia();
             }
 
             function setCover(index) {
-                mediaItems.forEach(m => m.isCover = false);
-                mediaItems[index].isCover = true;
+                // To set as cover, we move it to index 0 manually
                 const coverItem = mediaItems.splice(index, 1)[0];
                 mediaItems.unshift(coverItem);
+                
+                mediaItems.forEach(m => m.isCover = false);
+                mediaItems[0].isCover = true;
+                
                 renderMediaPreviews();
             }
 
@@ -2975,7 +3052,8 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach((img, idx) => {
-                   carouselHtml += `<img src="/images/${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                    // Lazy load thumbnails in Gallery view
+                    carouselHtml += `<img src="/images/thumb_${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
@@ -3115,7 +3193,8 @@ def get_html(request: Request):
                 
                 const imgs = parseImages(p.image_path);
                 mediaItems = imgs.map((img, idx) => ({
-                    type: 'existing', val: img, url: '/images/' + img, isCover: idx === 0 
+                    // For editing, preview with thumbnail path where possible, or fallback
+                    type: 'existing', val: img, url: '/images/thumb_' + img, isCover: idx === 0 
                 }));
                 renderMediaPreviews();
 
@@ -3218,7 +3297,7 @@ def get_html(request: Request):
                 
                 const imgs = parseImages(p.image_path);
                 mediaItems = imgs.map((img, idx) => ({
-                    type: 'existing', val: img, url: '/images/' + img, isCover: idx === 0 
+                    type: 'existing', val: img, url: '/images/thumb_' + img, isCover: idx === 0 
                 }));
                 renderMediaPreviews();
 
@@ -3273,7 +3352,7 @@ def get_html(request: Request):
                                     <span class="text-xs text-gray-400">Changed by: <span class="text-white">${safeEditor}</span> on ${date}</span>
                                 </div>
                                 <div class="flex gap-4">
-                                    <img src="/images/${coverImg}" onclick="openLightbox('/images/${coverImg}')" class="w-24 h-24 object-cover rounded border border-gray-700 flex-shrink-0 bg-gray-800 cursor-zoom-in">
+                                    <img src="/images/thumb_${coverImg}" onclick="openLightbox('/images/${coverImg}')" class="w-24 h-24 object-cover rounded border border-gray-700 flex-shrink-0 bg-gray-800 cursor-zoom-in">
                                     <div class="flex-grow min-w-0">
                                         <h4 class="font-bold text-white mb-1 truncate">${safeTitle}</h4>
                                         <p class="text-xs text-gray-400 mb-2 truncate">Author: ${safeAuthor} | Tags: ${safeTags}</p>
@@ -3414,7 +3493,7 @@ def get_html(request: Request):
                 const method = editId ? 'PUT' : 'POST';
 
                 try {
-                    const res = await fetch(url, { method: method, body: formData });
+                    const res = await window.fetch(url, { method: method, body: formData });
                     if (!res.ok) {
                         const error = await res.json();
                         alert("Error: " + error.detail);
