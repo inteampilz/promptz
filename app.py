@@ -118,7 +118,6 @@ def init_db():
     if cv_cols and 'vote_type' not in cv_cols:
         c.execute("ALTER TABLE comment_votes ADD COLUMN vote_type INTEGER DEFAULT -1")
 
-    # Explicit Database Indexing for Performance
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_user_email ON prompts(user_email)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_is_shared ON prompts(is_shared)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_forked ON prompts(forked_from)")
@@ -194,12 +193,10 @@ async def optimize_and_save_image(upload_file: UploadFile) -> str:
     file_path = os.path.join(IMG_DIR, filename)
     thumb_path = os.path.join(IMG_DIR, f"thumb_{filename}")
 
-    # Save Full Image
     full_img = img.copy()
     full_img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
     full_img.save(file_path, "webp", quality=80, optimize=True)
 
-    # Save Thumbnail
     thumb_img = img.copy()
     thumb_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
     thumb_img.save(thumb_path, "webp", quality=70, optimize=True)
@@ -231,7 +228,6 @@ def extract_metadata_from_image(image_bytes: bytes) -> str:
     except Exception: pass
     return ""
 
-# --- AUTH ROUTES ---
 @app.get('/login')
 async def login(request: Request):
     redirect_uri = request.url_for('auth_callback')
@@ -249,7 +245,6 @@ async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse('/')
 
-# --- ADMIN API ROUTES ---
 @app.post("/api/admin/generate-thumbnails")
 async def generate_missing_thumbnails(request: Request):
     user = request.session.get('user')
@@ -273,7 +268,6 @@ async def generate_missing_thumbnails(request: Request):
                     
     return {"status": "success", "generated_count": count}
 
-# --- API ROUTES ---
 @app.get("/api/prompts")
 def get_prompts(request: Request):
     user = request.session.get('user')
@@ -570,6 +564,8 @@ async def delete_prompt(prompt_id: str, request: Request):
     c.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
     c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (prompt_id,))
     c.execute("DELETE FROM favorites WHERE prompt_id = ?", (prompt_id,)) 
+    c.execute("DELETE FROM collection_prompts WHERE prompt_id = ?", (prompt_id,)) 
+    c.execute("DELETE FROM share_links WHERE prompt_id = ?", (prompt_id,)) 
     conn.commit()
     conn.close()
     return {"status": "deleted"}
@@ -613,6 +609,8 @@ async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
             c.execute("DELETE FROM prompts WHERE id = ?", (pid,))
             c.execute("DELETE FROM prompt_history WHERE prompt_id = ?", (pid,))
             c.execute("DELETE FROM favorites WHERE prompt_id = ?", (pid,)) 
+            c.execute("DELETE FROM collection_prompts WHERE prompt_id = ?", (pid,))
+            c.execute("DELETE FROM share_links WHERE prompt_id = ?", (pid,))
             
     conn.commit()
     conn.close()
@@ -1002,9 +1000,10 @@ def get_collections(request: Request):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("""
-        SELECT col.id, col.name, col.created_at, COUNT(cp.prompt_id) as prompt_count
+        SELECT col.id, col.name, col.created_at, COUNT(p.id) as prompt_count
         FROM collections col
         LEFT JOIN collection_prompts cp ON col.id = cp.collection_id
+        LEFT JOIN prompts p ON cp.prompt_id = p.id
         WHERE col.user_email = ?
         GROUP BY col.id
         ORDER BY col.created_at ASC
@@ -1396,7 +1395,9 @@ def view_shared_prompt(token: str):
     safe_title  = html_mod.escape(str(prompt['title'] or 'Untitled'))
     safe_author = html_mod.escape(str(prompt['author'] or 'Unknown'))
     tags_html   = ''.join(f'<span class="bg-gray-700 text-xs px-2 py-1 rounded">{html_mod.escape(str(t))}</span>' for t in tags)
-    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-cover aspect-square" loading="lazy">' for img in images)
+    
+    # FIXED: Replaced aspect-square and object-cover with object-contain and max height
+    imgs_html   = ''.join(f'<img src="/images/{html_mod.escape(str(img))}" class="w-full rounded-lg object-contain max-h-[75vh] bg-gray-950" loading="lazy">' for img in images)
     
     prompt_str  = str(prompt['prompt'] or '')
     prompt_js   = json.dumps(prompt_str).replace("</", "<\\/")
