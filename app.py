@@ -118,6 +118,7 @@ def init_db():
     if cv_cols and 'vote_type' not in cv_cols:
         c.execute("ALTER TABLE comment_votes ADD COLUMN vote_type INTEGER DEFAULT -1")
 
+    # Explicit Database Indexing for Performance
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_user_email ON prompts(user_email)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_is_shared ON prompts(is_shared)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_forked ON prompts(forked_from)")
@@ -193,10 +194,12 @@ async def optimize_and_save_image(upload_file: UploadFile) -> str:
     file_path = os.path.join(IMG_DIR, filename)
     thumb_path = os.path.join(IMG_DIR, f"thumb_{filename}")
 
+    # Save Full Image
     full_img = img.copy()
     full_img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
     full_img.save(file_path, "webp", quality=80, optimize=True)
 
+    # Save Thumbnail
     thumb_img = img.copy()
     thumb_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
     thumb_img.save(thumb_path, "webp", quality=70, optimize=True)
@@ -228,6 +231,7 @@ def extract_metadata_from_image(image_bytes: bytes) -> str:
     except Exception: pass
     return ""
 
+# --- AUTH ROUTES ---
 @app.get('/login')
 async def login(request: Request):
     redirect_uri = request.url_for('auth_callback')
@@ -245,6 +249,7 @@ async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse('/')
 
+# --- ADMIN API ROUTES ---
 @app.post("/api/admin/generate-thumbnails")
 async def generate_missing_thumbnails(request: Request):
     user = request.session.get('user')
@@ -268,6 +273,7 @@ async def generate_missing_thumbnails(request: Request):
                     
     return {"status": "success", "generated_count": count}
 
+# --- API ROUTES ---
 @app.get("/api/prompts")
 def get_prompts(request: Request):
     user = request.session.get('user')
@@ -1746,7 +1752,7 @@ def get_html(request: Request):
                     <div id="findReplaceContainer" class="hidden flex-col gap-2 mb-2 bg-gray-900 p-3 rounded border border-gray-700 shadow-inner">
                         <div class="flex gap-2 items-center">
                             <span class="text-xs font-bold text-gray-400 w-16">FIND</span>
-                            <input type="text" id="findText" placeholder="Text to find..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" oninput="findNext(true)" onkeydown="if(event.key==='Enter'){event.preventDefault(); findNext();}">
+                            <input type="text" id="findText" placeholder="Text to find..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" oninput="updateFindMatches()" onkeydown="if(event.key==='Enter'){event.preventDefault(); findNext();}">
                             <span id="findMatchCount" class="text-xs text-gray-400 text-center min-w-[3rem]">0/0</span>
                             <button type="button" onclick="findPrev()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▲</button>
                             <button type="button" onclick="findNext()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▼</button>
@@ -2045,12 +2051,11 @@ def get_html(request: Request):
                 }
             }
 
-            function findNext(reset = false) {
+            function findNext() {
                 updateFindMatches();
                 if (findMatches.length === 0) return;
-                if (!reset) {
-                    currentMatchIndex = (currentMatchIndex + 1) % findMatches.length;
-                }
+                
+                currentMatchIndex = (currentMatchIndex + 1) % findMatches.length;
                 document.getElementById('findMatchCount').innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
                 highlightMatch();
             }
@@ -2058,13 +2063,18 @@ def get_html(request: Request):
             function findPrev() {
                 updateFindMatches();
                 if (findMatches.length === 0) return;
+                
                 currentMatchIndex = (currentMatchIndex - 1 + findMatches.length) % findMatches.length;
                 document.getElementById('findMatchCount').innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
                 highlightMatch();
             }
 
             function replaceCurrent() {
-                if (currentMatchIndex < 0 || findMatches.length === 0) return;
+                if (currentMatchIndex < 0 || findMatches.length === 0) {
+                    updateFindMatches();
+                    if (findMatches.length === 0) return;
+                    currentMatchIndex = 0;
+                }
                 
                 const promptArea = document.getElementById('formPrompt');
                 const replStr = document.getElementById('replaceText').value;
@@ -2074,7 +2084,14 @@ def get_html(request: Request):
                 promptArea.value = text.substring(0, match.start) + replStr + text.substring(match.end);
                 
                 updateFindMatches();
-                highlightMatch();
+                
+                if (findMatches.length > 0) {
+                    if (currentMatchIndex >= findMatches.length) {
+                        currentMatchIndex = 0;
+                    }
+                    document.getElementById('findMatchCount').innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
+                    highlightMatch();
+                }
             }
 
             function replaceAll() {
