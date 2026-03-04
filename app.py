@@ -1699,7 +1699,7 @@ def get_html(request: Request):
         </div>
 
         <div id="promptModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
-            <div class="bg-gray-800 p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div class="bg-gray-800 p-4 sm:p-6 rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto overflow-x-hidden">
                 <h2 id="modalTitle" class="text-2xl font-bold mb-4">Add New Prompt</h2>
                 <form id="promptForm" onsubmit="submitForm(event)">
                     <input type="hidden" id="editPromptId" name="editPromptId" value="">
@@ -1749,23 +1749,27 @@ def get_html(request: Request):
                         </div>
                     </div>
                     
-                    <div id="findReplaceContainer" class="hidden flex-col gap-2 mb-2 bg-gray-900 p-3 rounded border border-gray-700 shadow-inner">
-                        <div class="flex gap-2 items-center">
-                            <span class="text-xs font-bold text-gray-400 w-16">FIND</span>
-                            <input type="text" id="findText" placeholder="Text to find..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" oninput="updateFindMatches()" onkeydown="if(event.key==='Enter'){event.preventDefault(); findNext();}">
-                            <span id="findMatchCount" class="text-xs text-gray-400 text-center min-w-[3rem]">0/0</span>
-                            <button type="button" onclick="findPrev()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▲</button>
-                            <button type="button" onclick="findNext()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▼</button>
+                    <div id="findReplaceContainer" class="hidden flex-col gap-2 mb-2 bg-gray-900 p-2 sm:p-3 rounded border border-gray-700 shadow-inner text-sm">
+                        <div class="flex flex-wrap sm:flex-nowrap gap-2 items-center">
+                            <span class="text-xs font-bold text-gray-400 hidden sm:block w-16 flex-shrink-0">FIND</span>
+                            <input type="text" id="findText" placeholder="Find text..." class="flex-1 min-w-[120px] w-full p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" oninput="updateFindMatches(false)" onkeydown="if(event.key==='Enter'){event.preventDefault(); findNext();}">
+                            <div class="flex items-center gap-1 flex-shrink-0 ml-auto">
+                                <span id="findMatchCount" class="text-xs text-gray-400 text-center min-w-[2.5rem]">0/0</span>
+                                <button type="button" onclick="findPrev()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▲</button>
+                                <button type="button" onclick="findNext()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▼</button>
+                            </div>
                         </div>
-                        <div class="flex gap-2 items-center">
-                            <span class="text-xs font-bold text-gray-400 w-16">REPLACE</span>
-                            <input type="text" id="replaceText" placeholder="Replacement text..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" onkeydown="if(event.key==='Enter'){event.preventDefault(); replaceCurrent();}">
-                            <button type="button" onclick="replaceCurrent()" class="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-sm font-bold border border-blue-600 transition-colors focus:outline-none">Replace</button>
-                            <button type="button" onclick="replaceAll()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm border border-gray-600 transition-colors focus:outline-none">All</button>
+                        <div class="flex flex-wrap sm:flex-nowrap gap-2 items-center">
+                            <span class="text-xs font-bold text-gray-400 hidden sm:block w-16 flex-shrink-0">REPLACE</span>
+                            <input type="text" id="replaceText" placeholder="Replace with..." class="flex-1 min-w-[120px] w-full p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" onkeydown="if(event.key==='Enter'){event.preventDefault(); replaceCurrent();}">
+                            <div class="flex items-center gap-1 flex-shrink-0 ml-auto">
+                                <button type="button" onclick="replaceCurrent()" class="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-sm font-bold border border-blue-600 transition-colors focus:outline-none">Rep</button>
+                                <button type="button" onclick="replaceAll()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm border border-gray-600 transition-colors focus:outline-none">All</button>
+                            </div>
                         </div>
                     </div>
 
-                    <textarea id="formPrompt" name="prompt" oninput="updateFindMatches()" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-3 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-40 transition-colors focus:outline-none focus:border-yellow-400"></textarea>
+                    <textarea id="formPrompt" name="prompt" oninput="updateFindMatches(false)" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-3 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-40 transition-colors focus:outline-none focus:border-yellow-400"></textarea>
                     
                     <div id="dropZone" class="w-full p-6 mb-2 rounded bg-gray-700 border-2 border-dashed border-gray-500 text-center cursor-pointer hover:border-yellow-400 hover:bg-gray-600 transition-colors" onclick="document.getElementById('hiddenFileInput').click()">
                         <input type="file" id="hiddenFileInput" multiple accept="image/*" class="hidden" onchange="handleFileSelect(event)">
@@ -2011,7 +2015,7 @@ def get_html(request: Request):
             let findMatches = [];
             let currentMatchIndex = -1;
 
-            function updateFindMatches() {
+            function updateFindMatches(highlight = true) {
                 const promptArea = document.getElementById('formPrompt');
                 if(!promptArea) return;
                 const text = promptArea.value;
@@ -2038,6 +2042,7 @@ def get_html(request: Request):
                     if (currentMatchIndex >= findMatches.length) currentMatchIndex = 0;
                     if (currentMatchIndex < 0) currentMatchIndex = 0;
                     countSpan.innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
+                    if (highlight) highlightMatch();
                 }
             }
 
@@ -2052,7 +2057,7 @@ def get_html(request: Request):
             }
 
             function findNext() {
-                updateFindMatches();
+                updateFindMatches(false);
                 if (findMatches.length === 0) return;
                 
                 currentMatchIndex = (currentMatchIndex + 1) % findMatches.length;
@@ -2061,7 +2066,7 @@ def get_html(request: Request):
             }
 
             function findPrev() {
-                updateFindMatches();
+                updateFindMatches(false);
                 if (findMatches.length === 0) return;
                 
                 currentMatchIndex = (currentMatchIndex - 1 + findMatches.length) % findMatches.length;
@@ -2071,7 +2076,7 @@ def get_html(request: Request):
 
             function replaceCurrent() {
                 if (currentMatchIndex < 0 || findMatches.length === 0) {
-                    updateFindMatches();
+                    updateFindMatches(false);
                     if (findMatches.length === 0) return;
                     currentMatchIndex = 0;
                 }
@@ -2083,7 +2088,7 @@ def get_html(request: Request):
                 const text = promptArea.value;
                 promptArea.value = text.substring(0, match.start) + replStr + text.substring(match.end);
                 
-                updateFindMatches();
+                updateFindMatches(false);
                 
                 if (findMatches.length > 0) {
                     if (currentMatchIndex >= findMatches.length) {
@@ -2108,7 +2113,7 @@ def get_html(request: Request):
                 void promptArea.offsetWidth;
                 promptArea.classList.add('flash-success');
                 
-                updateFindMatches();
+                updateFindMatches(false);
             }
 
             // --- BULK MODE LOGIK ---
@@ -3325,7 +3330,7 @@ def get_html(request: Request):
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
                 document.getElementById('findReplaceContainer').classList.add('hidden');
-                updateFindMatches();
+                updateFindMatches(false);
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
@@ -3353,7 +3358,7 @@ def get_html(request: Request):
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
                 document.getElementById('findReplaceContainer').classList.add('hidden');
-                updateFindMatches();
+                updateFindMatches(false);
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
@@ -3461,7 +3466,7 @@ def get_html(request: Request):
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
                 document.getElementById('findReplaceContainer').classList.add('hidden');
-                updateFindMatches();
+                updateFindMatches(false);
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
