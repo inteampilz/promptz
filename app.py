@@ -8,7 +8,7 @@ import zipfile
 import html as html_mod
 from datetime import datetime, timedelta
 from typing import Optional, List
-from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Form, UploadFile, File, Request, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -121,6 +121,7 @@ def init_db():
     # Explicit Database Indexing for Performance
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_user_email ON prompts(user_email)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_is_shared ON prompts(is_shared)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_forked ON prompts(forked_from)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_email)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_history_prompt_id ON prompt_history(prompt_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_comments_prompt_id ON comments(prompt_id)")
@@ -247,6 +248,30 @@ async def auth_callback(request: Request):
 async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse('/')
+
+# --- ADMIN API ROUTES ---
+@app.post("/api/admin/generate-thumbnails")
+async def generate_missing_thumbnails(request: Request):
+    user = request.session.get('user')
+    if not is_admin(user): raise HTTPException(status_code=403, detail="Admin only")
+    
+    count = 0
+    for filename in os.listdir(IMG_DIR):
+        if filename.endswith(".webp") and not filename.startswith("thumb_"):
+            thumb_path = os.path.join(IMG_DIR, f"thumb_{filename}")
+            full_path = os.path.join(IMG_DIR, filename)
+            
+            if not os.path.exists(thumb_path):
+                try:
+                    img = Image.open(full_path)
+                    thumb_img = img.copy()
+                    thumb_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    thumb_img.save(thumb_path, "webp", quality=70, optimize=True)
+                    count += 1
+                except Exception as e:
+                    print(f"Error generating thumbnail for {filename}: {e}")
+                    
+    return {"status": "success", "generated_count": count}
 
 # --- API ROUTES ---
 @app.get("/api/prompts")
@@ -1685,6 +1710,11 @@ def get_html(request: Request):
                     <input type="file" id="importFile" accept=".zip,.json,.csv" class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white text-sm">
                     <button onclick="importData()" id="importBtn" class="w-full bg-green-700 hover:bg-green-600 text-white font-bold py-2 px-4 rounded transition-colors">Upload & Import</button>
                 </div>
+                
+                <div id="adminToolsSection" class="hidden mt-6 pt-6 border-t border-gray-700">
+                    <h3 class="text-lg font-bold mb-2 text-red-400">🛠️ Admin Tools</h3>
+                    <button onclick="generateMissingThumbnails(this)" class="w-full bg-red-900 hover:bg-red-800 text-white font-bold py-2 px-4 rounded transition-colors border border-red-700">Generate Missing Thumbnails</button>
+                </div>
             </div>
         </div>
 
@@ -1733,6 +1763,15 @@ def get_html(request: Request):
                             ✨ Extract from Cover Image
                         </button>
                     </div>
+                    
+                    <div class="flex gap-2 mb-2 items-center bg-gray-900 p-2 rounded border border-gray-700">
+                        <span class="text-xs text-gray-400 font-bold uppercase tracking-wider hidden sm:inline">Find:</span>
+                        <input type="text" id="findText" placeholder="Find..." class="flex-1 p-1 px-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400">
+                        <span class="text-xs text-gray-400 font-bold uppercase tracking-wider hidden sm:inline">Replace:</span>
+                        <input type="text" id="replaceText" placeholder="Replace..." class="flex-1 p-1 px-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400">
+                        <button type="button" onclick="executeFindReplace()" class="bg-gray-600 hover:bg-gray-500 text-white px-3 py-1 rounded text-sm transition-colors font-bold">Replace</button>
+                    </div>
+
                     <textarea id="formPrompt" name="prompt" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-32 transition-colors"></textarea>
                     
                     <div id="dropZone" class="w-full p-6 mb-2 rounded bg-gray-700 border-2 border-dashed border-gray-500 text-center cursor-pointer hover:border-yellow-400 hover:bg-gray-600 transition-colors" onclick="document.getElementById('hiddenFileInput').click()">
@@ -1933,6 +1972,10 @@ def get_html(request: Request):
             
             const IS_ADMIN = __IS_ADMIN__;
 
+            if (IS_ADMIN) {
+                document.getElementById('adminToolsSection').classList.remove('hidden');
+            }
+
             function escapeHTML(str) {
                 if (!str) return '';
                 return str.replace(/[&<>'"]/g, 
@@ -1947,6 +1990,45 @@ def get_html(request: Request):
             
             function escapeRegExp(string) {
               return string.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&');
+            }
+
+            // --- ADMIN TOOLS ---
+            async function generateMissingThumbnails(btn) {
+                const originalText = btn.innerText;
+                btn.innerText = '⏳ Generating Thumbnails...';
+                btn.disabled = true;
+
+                try {
+                    const res = await fetch('/api/admin/generate-thumbnails', { method: 'POST' });
+                    if (res.ok) {
+                        const data = await res.json();
+                        alert(`Successfully generated ${data.generated_count} missing thumbnails.`);
+                    } else {
+                        const error = await res.json();
+                        alert("Error: " + error.detail);
+                    }
+                } catch(e) {
+                    alert("Failed to connect to admin endpoint.");
+                }
+                
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+
+            // --- FIND AND REPLACE IN PROMPT ---
+            function executeFindReplace() {
+                const findStr = document.getElementById('findText').value;
+                const replStr = document.getElementById('replaceText').value;
+                const promptArea = document.getElementById('formPrompt');
+                
+                if (!findStr) return;
+                
+                const regex = new RegExp(escapeRegExp(findStr), 'g');
+                promptArea.value = promptArea.value.replace(regex, replStr);
+                
+                promptArea.classList.remove('flash-success');
+                void promptArea.offsetWidth;
+                promptArea.classList.add('flash-success');
             }
 
             // --- BULK MODE LOGIK ---
@@ -2507,11 +2589,9 @@ def get_html(request: Request):
                     animation: 150,
                     ghostClass: 'sortable-ghost',
                     onEnd: function (evt) {
-                        // Reorder underlying mediaItems Array to match UI
                         const itemEl = mediaItems.splice(evt.oldIndex, 1)[0];
                         mediaItems.splice(evt.newIndex, 0, itemEl);
                         
-                        // Recalculate 'Cover' state (first element is always cover)
                         mediaItems.forEach(m => m.isCover = false);
                         if (mediaItems.length > 0) mediaItems[0].isCover = true;
                         
@@ -2525,7 +2605,7 @@ def get_html(request: Request):
                 if (mediaItems.length === 0) { container.innerHTML = ''; return; }
                 container.innerHTML = mediaItems.map((item, index) => `
                     <div class="relative w-24 h-24 flex-shrink-0 rounded overflow-hidden border-2 transition-colors ${item.isCover ? 'border-yellow-400' : 'border-gray-600'} cursor-grab active:cursor-grabbing">
-                        <img src="${item.url}" class="w-full h-full object-cover">
+                        <img src="${item.url}" onerror="this.onerror=null; this.src='${item.url.replace('/images/thumb_', '/images/')}';" class="w-full h-full object-cover">
                         <div class="absolute top-0 right-0 bg-black/80 flex rounded-bl">
                             <button type="button" onclick="event.stopPropagation(); setCover(${index})" class="px-2 py-1 hover:text-yellow-400 text-xs transition-colors ${item.isCover ? 'text-yellow-400' : 'text-gray-400'}" title="Make Cover">⭐</button>
                             <button type="button" onclick="event.stopPropagation(); removeMedia(${index})" class="px-2 py-1 hover:text-red-500 text-gray-400 text-xs transition-colors" title="Remove">✕</button>
@@ -2538,7 +2618,6 @@ def get_html(request: Request):
             }
 
             function setCover(index) {
-                // To set as cover, we move it to index 0 manually
                 const coverItem = mediaItems.splice(index, 1)[0];
                 mediaItems.unshift(coverItem);
                 
@@ -3052,8 +3131,8 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach((img, idx) => {
-                    // Lazy load thumbnails in Gallery view
-                    carouselHtml += `<img src="/images/thumb_${img}" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
+                    // Lazy load thumbnails in Gallery view with fallback to full size
+                    carouselHtml += `<img src="/images/thumb_${img}" onerror="this.onerror=null; this.src='/images/${img}';" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
 
@@ -3165,6 +3244,9 @@ def get_html(request: Request):
                 document.getElementById('promptForm').reset();
                 document.getElementById('is_shared').checked = true;
                 
+                document.getElementById('findText').value = '';
+                document.getElementById('replaceText').value = '';
+                
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
                 
@@ -3187,6 +3269,9 @@ def get_html(request: Request):
                 document.getElementById('formPrompt').value = p.prompt;
                 document.getElementById('is_shared').checked = (p.is_shared === 1);
                 document.getElementById('is_shared').disabled = !p.is_mine;
+                
+                document.getElementById('findText').value = '';
+                document.getElementById('replaceText').value = '';
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
@@ -3292,6 +3377,9 @@ def get_html(request: Request):
                 document.getElementById('is_shared').checked = false; 
                 document.getElementById('is_shared').disabled = false;
                 
+                document.getElementById('findText').value = '';
+                document.getElementById('replaceText').value = '';
+                
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
                 
@@ -3352,7 +3440,7 @@ def get_html(request: Request):
                                     <span class="text-xs text-gray-400">Changed by: <span class="text-white">${safeEditor}</span> on ${date}</span>
                                 </div>
                                 <div class="flex gap-4">
-                                    <img src="/images/thumb_${coverImg}" onclick="openLightbox('/images/${coverImg}')" class="w-24 h-24 object-cover rounded border border-gray-700 flex-shrink-0 bg-gray-800 cursor-zoom-in">
+                                    <img src="/images/thumb_${coverImg}" onerror="this.onerror=null; this.src='/images/${coverImg}';" onclick="openLightbox('/images/${coverImg}')" class="w-24 h-24 object-cover rounded border border-gray-700 flex-shrink-0 bg-gray-800 cursor-zoom-in">
                                     <div class="flex-grow min-w-0">
                                         <h4 class="font-bold text-white mb-1 truncate">${safeTitle}</h4>
                                         <p class="text-xs text-gray-400 mb-2 truncate">Author: ${safeAuthor} | Tags: ${safeTags}</p>
