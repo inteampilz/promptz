@@ -118,7 +118,6 @@ def init_db():
     if cv_cols and 'vote_type' not in cv_cols:
         c.execute("ALTER TABLE comment_votes ADD COLUMN vote_type INTEGER DEFAULT -1")
 
-    # Explicit Database Indexing for Performance
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_user_email ON prompts(user_email)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_is_shared ON prompts(is_shared)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prompts_forked ON prompts(forked_from)")
@@ -194,12 +193,10 @@ async def optimize_and_save_image(upload_file: UploadFile) -> str:
     file_path = os.path.join(IMG_DIR, filename)
     thumb_path = os.path.join(IMG_DIR, f"thumb_{filename}")
 
-    # Save Full Image
     full_img = img.copy()
     full_img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
     full_img.save(file_path, "webp", quality=80, optimize=True)
 
-    # Save Thumbnail
     thumb_img = img.copy()
     thumb_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
     thumb_img.save(thumb_path, "webp", quality=70, optimize=True)
@@ -231,7 +228,6 @@ def extract_metadata_from_image(image_bytes: bytes) -> str:
     except Exception: pass
     return ""
 
-# --- AUTH ROUTES ---
 @app.get('/login')
 async def login(request: Request):
     redirect_uri = request.url_for('auth_callback')
@@ -249,7 +245,6 @@ async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse('/')
 
-# --- ADMIN API ROUTES ---
 @app.post("/api/admin/generate-thumbnails")
 async def generate_missing_thumbnails(request: Request):
     user = request.session.get('user')
@@ -273,7 +268,6 @@ async def generate_missing_thumbnails(request: Request):
                     
     return {"status": "success", "generated_count": count}
 
-# --- API ROUTES ---
 @app.get("/api/prompts")
 def get_prompts(request: Request):
     user = request.session.get('user')
@@ -574,7 +568,6 @@ async def delete_prompt(prompt_id: str, request: Request):
     conn.close()
     return {"status": "deleted"}
 
-# --- BULK API ROUTES ---
 @app.post("/api/prompts/bulk/delete")
 async def bulk_delete(request: Request, prompt_ids: str = Form(...)):
     user = request.session.get('user')
@@ -995,7 +988,6 @@ async def merge_tags(request: Request, old_tag: str = Form(...), new_tag: str = 
     conn.close()
     return {"status": "success"}
 
-# --- COLLECTIONS API ---
 @app.get("/api/collections")
 def get_collections(request: Request):
     user = request.session.get('user')
@@ -1096,7 +1088,6 @@ async def remove_from_collection(collection_id: str, prompt_id: str, request: Re
     conn.close()
     return {"status": "success"}
 
-# --- EXPORT & IMPORT API ---
 @app.get("/api/export/{format}")
 def export_data(format: str, request: Request):
     user = request.session.get('user')
@@ -1105,38 +1096,30 @@ def export_data(format: str, request: Request):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
-    # 1. Prompts
     c.execute("SELECT * FROM prompts WHERE is_shared = 1 OR user_email = ?", (user['email'],))
     prompts_rows = [dict(r) for r in c.fetchall()]
     prompt_ids_set = set(r['id'] for r in prompts_rows)
     
-    # 2. History
     c.execute("SELECT * FROM prompt_history")
     history_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
     
-    # 3. Favorites
     c.execute("SELECT * FROM favorites WHERE user_email = ?", (user['email'],))
     favorites_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
 
-    # 4. Comments
     c.execute("SELECT * FROM comments")
     comments_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
     comment_ids_set = set(r['id'] for r in comments_rows)
 
-    # 5. Comment Votes
     c.execute("SELECT * FROM comment_votes")
     comment_votes_rows = [dict(r) for r in c.fetchall() if r['comment_id'] in comment_ids_set]
 
-    # 6. Share Links
     c.execute("SELECT * FROM share_links WHERE created_by = ?", (user['email'],))
     share_links_rows = [dict(r) for r in c.fetchall() if r['prompt_id'] in prompt_ids_set]
     
-    # 7. Collections
     c.execute("SELECT * FROM collections WHERE user_email = ?", (user['email'],))
     collections_rows = [dict(r) for r in c.fetchall()]
     collection_ids_set = set(r['id'] for r in collections_rows)
     
-    # 8. Collection Prompts
     c.execute("SELECT * FROM collection_prompts")
     collection_prompts_rows = [dict(r) for r in c.fetchall() if r['collection_id'] in collection_ids_set]
     
@@ -1240,7 +1223,6 @@ async def import_data(request: Request, file: UploadFile = File(...)):
     added_history = 0
     id_map = {} 
     
-    # 1. Prompts
     for row in data_payload.get("prompts", []):
         prompt_text = str(row.get("prompt", "")).strip()
         if not prompt_text: continue
@@ -1274,7 +1256,6 @@ async def import_data(request: Request, file: UploadFile = File(...)):
                   (new_id, title, prompt_text, author, tags, image_path, user_email, is_shared, copy_count, forked_from))
         added_prompts += 1
         
-    # 2. History
     for h_row in data_payload.get("history", []):
         old_prompt_id = h_row.get("prompt_id")
         new_prompt_id = id_map.get(old_prompt_id)
@@ -1291,13 +1272,11 @@ async def import_data(request: Request, file: UploadFile = File(...)):
                    h_row.get("tags"), h_row.get("image_path"), h_row.get("edited_by"), h_row.get("edited_at")))
         added_history += 1
         
-    # 3. Favorites
     for fav in data_payload.get("favorites", []):
         p_id = id_map.get(fav.get("prompt_id"))
         if p_id:
             c.execute("INSERT OR IGNORE INTO favorites (user_email, prompt_id) VALUES (?, ?)", (user['email'], p_id))
             
-    # 4. Collections
     col_id_map = {}
     for col in data_payload.get("collections", []):
         old_cid = col.get("id")
@@ -1313,21 +1292,18 @@ async def import_data(request: Request, file: UploadFile = File(...)):
             c.execute("INSERT INTO collections (id, name, user_email, created_at) VALUES (?, ?, ?, ?)",
                       (new_cid, c_name, user['email'], col.get('created_at')))
 
-    # 5. Collection Prompts
     for cp in data_payload.get("collection_prompts", []):
         c_id = col_id_map.get(cp.get("collection_id"))
         p_id = id_map.get(cp.get("prompt_id"))
         if c_id and p_id:
             c.execute("INSERT OR IGNORE INTO collection_prompts (collection_id, prompt_id) VALUES (?, ?)", (c_id, p_id))
 
-    # 6. Share Links
     for sl in data_payload.get("share_links", []):
         p_id = id_map.get(sl.get("prompt_id"))
         if p_id:
             c.execute("INSERT OR IGNORE INTO share_links (token, prompt_id, created_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
                       (sl.get('token'), p_id, user['email'], sl.get('expires_at'), sl.get('created_at')))
 
-    # 7. Comments
     comment_id_map = {}
     for cmt in data_payload.get("comments", []):
         p_id = id_map.get(cmt.get("prompt_id"))
@@ -1347,7 +1323,6 @@ async def import_data(request: Request, file: UploadFile = File(...)):
                      VALUES (?, ?, ?, ?, ?, ?, ?)""",
                   (new_cmt_id, p_id, cmt.get('parent_id'), cmt.get('author_email'), cmt.get('author_name'), cmt.get('body'), cmt.get('created_at')))
 
-    # 8. Comment Votes
     for cv in data_payload.get("comment_votes", []):
         cmt_id = comment_id_map.get(cv.get("comment_id"), cv.get("comment_id"))
         if cmt_id:
@@ -1497,7 +1472,6 @@ def view_shared_prompt(token: str):
   </script>
 </body></html>""")
 
-# --- FRONTEND ---
 @app.get("/", response_class=HTMLResponse)
 def get_html(request: Request):
     user = request.session.get('user')
@@ -1759,20 +1733,33 @@ def get_html(request: Request):
                     
                     <div class="flex justify-between items-end mb-1">
                         <label class="text-sm font-medium text-gray-400">Prompt Text</label>
-                        <button type="button" onclick="forceExtractPrompt(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
-                            ✨ Extract from Cover Image
-                        </button>
+                        <div class="flex gap-2">
+                            <button type="button" onclick="document.getElementById('findReplaceContainer').classList.toggle('hidden')" class="text-xs bg-gray-700 hover:bg-blue-500 hover:text-white text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                                🔍 Find / Replace
+                            </button>
+                            <button type="button" onclick="forceExtractPrompt(this)" class="text-xs bg-gray-700 hover:bg-yellow-500 hover:text-black text-gray-300 px-2 py-1 rounded transition-colors focus:outline-none">
+                                ✨ Extract from Cover
+                            </button>
+                        </div>
                     </div>
                     
-                    <div class="flex gap-2 mb-2 items-center bg-gray-900 p-2 rounded border border-gray-700">
-                        <span class="text-xs text-gray-400 font-bold uppercase tracking-wider hidden sm:inline">Find:</span>
-                        <input type="text" id="findText" placeholder="Find..." class="flex-1 p-1 px-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400">
-                        <span class="text-xs text-gray-400 font-bold uppercase tracking-wider hidden sm:inline">Replace:</span>
-                        <input type="text" id="replaceText" placeholder="Replace..." class="flex-1 p-1 px-2 rounded bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400">
-                        <button type="button" onclick="executeFindReplace()" class="bg-gray-600 hover:bg-gray-500 text-white px-3 py-1 rounded text-sm transition-colors font-bold">Replace</button>
+                    <div id="findReplaceContainer" class="hidden flex-col gap-2 mb-2 bg-gray-900 p-3 rounded border border-gray-700 shadow-inner">
+                        <div class="flex gap-2 items-center">
+                            <span class="text-xs font-bold text-gray-400 w-16">FIND</span>
+                            <input type="text" id="findText" placeholder="Text to find..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" oninput="findNext(true)" onkeydown="if(event.key==='Enter'){event.preventDefault(); findNext();}">
+                            <span id="findMatchCount" class="text-xs text-gray-400 text-center min-w-[3rem]">0/0</span>
+                            <button type="button" onclick="findPrev()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▲</button>
+                            <button type="button" onclick="findNext()" class="bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-1 rounded border border-gray-600 focus:outline-none">▼</button>
+                        </div>
+                        <div class="flex gap-2 items-center">
+                            <span class="text-xs font-bold text-gray-400 w-16">REPLACE</span>
+                            <input type="text" id="replaceText" placeholder="Replacement text..." class="flex-1 p-1.5 rounded bg-gray-800 border border-gray-600 text-white text-sm focus:outline-none focus:border-blue-400" onkeydown="if(event.key==='Enter'){event.preventDefault(); replaceCurrent();}">
+                            <button type="button" onclick="replaceCurrent()" class="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-sm font-bold border border-blue-600 transition-colors focus:outline-none">Replace</button>
+                            <button type="button" onclick="replaceAll()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm border border-gray-600 transition-colors focus:outline-none">All</button>
+                        </div>
                     </div>
 
-                    <textarea id="formPrompt" name="prompt" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-2 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-32 transition-colors"></textarea>
+                    <textarea id="formPrompt" name="prompt" oninput="updateFindMatches()" placeholder="The actual prompt... Use [PLACEHOLDERS] to create dynamic templates!" required class="w-full p-3 mb-3 rounded bg-gray-700 border border-gray-600 text-white h-40 transition-colors focus:outline-none focus:border-yellow-400"></textarea>
                     
                     <div id="dropZone" class="w-full p-6 mb-2 rounded bg-gray-700 border-2 border-dashed border-gray-500 text-center cursor-pointer hover:border-yellow-400 hover:bg-gray-600 transition-colors" onclick="document.getElementById('hiddenFileInput').click()">
                         <input type="file" id="hiddenFileInput" multiple accept="image/*" class="hidden" onchange="handleFileSelect(event)">
@@ -1935,12 +1922,10 @@ def get_html(request: Request):
         </div>
 
         <script>
-            // Utility for CSRF Token fetching
             function getCsrfToken() {
                 return document.cookie.split('; ').find(row => row.startsWith('csrftoken='))?.split('=')[1] || '';
             }
 
-            // Wrapping the standard fetch to auto-include CSRF Token for mutating requests
             const originalFetch = window.fetch;
             window.fetch = function() {
                 let [resource, config] = arguments;
@@ -1961,7 +1946,7 @@ def get_html(request: Request):
             
             let showOnlyFavorites = false;
             let mediaItems = []; 
-            let sortableMediaInstance = null; // Sortable JS Instance
+            let sortableMediaInstance = null; 
             
             let isBulkMode = false;
             let selectedPrompts = new Set();
@@ -1973,7 +1958,8 @@ def get_html(request: Request):
             const IS_ADMIN = __IS_ADMIN__;
 
             if (IS_ADMIN) {
-                document.getElementById('adminToolsSection').classList.remove('hidden');
+                const adminSection = document.getElementById('adminToolsSection');
+                if(adminSection) adminSection.classList.remove('hidden');
             }
 
             function escapeHTML(str) {
@@ -2015,20 +2001,97 @@ def get_html(request: Request):
                 btn.disabled = false;
             }
 
-            // --- FIND AND REPLACE IN PROMPT ---
-            function executeFindReplace() {
+            // --- FIND AND REPLACE LOGIC ---
+            let findMatches = [];
+            let currentMatchIndex = -1;
+
+            function updateFindMatches() {
+                const promptArea = document.getElementById('formPrompt');
+                if(!promptArea) return;
+                const text = promptArea.value;
+                const findStr = document.getElementById('findText').value;
+                const countSpan = document.getElementById('findMatchCount');
+                
+                findMatches = [];
+                if (!findStr) {
+                    countSpan.innerText = '0/0';
+                    currentMatchIndex = -1;
+                    return;
+                }
+
+                const regex = new RegExp(escapeRegExp(findStr), 'gi');
+                let match;
+                while ((match = regex.exec(text)) !== null) {
+                    findMatches.push({ start: match.index, end: match.index + match[0].length });
+                }
+
+                if (findMatches.length === 0) {
+                    countSpan.innerText = '0/0';
+                    currentMatchIndex = -1;
+                } else {
+                    if (currentMatchIndex >= findMatches.length) currentMatchIndex = 0;
+                    if (currentMatchIndex < 0) currentMatchIndex = 0;
+                    countSpan.innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
+                }
+            }
+
+            function highlightMatch() {
+                if (currentMatchIndex >= 0 && currentMatchIndex < findMatches.length) {
+                    const promptArea = document.getElementById('formPrompt');
+                    const match = findMatches[currentMatchIndex];
+                    
+                    promptArea.focus();
+                    promptArea.setSelectionRange(match.start, match.end);
+                }
+            }
+
+            function findNext(reset = false) {
+                updateFindMatches();
+                if (findMatches.length === 0) return;
+                if (!reset) {
+                    currentMatchIndex = (currentMatchIndex + 1) % findMatches.length;
+                }
+                document.getElementById('findMatchCount').innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
+                highlightMatch();
+            }
+
+            function findPrev() {
+                updateFindMatches();
+                if (findMatches.length === 0) return;
+                currentMatchIndex = (currentMatchIndex - 1 + findMatches.length) % findMatches.length;
+                document.getElementById('findMatchCount').innerText = `${currentMatchIndex + 1}/${findMatches.length}`;
+                highlightMatch();
+            }
+
+            function replaceCurrent() {
+                if (currentMatchIndex < 0 || findMatches.length === 0) return;
+                
+                const promptArea = document.getElementById('formPrompt');
+                const replStr = document.getElementById('replaceText').value;
+                const match = findMatches[currentMatchIndex];
+                
+                const text = promptArea.value;
+                promptArea.value = text.substring(0, match.start) + replStr + text.substring(match.end);
+                
+                updateFindMatches();
+                highlightMatch();
+            }
+
+            function replaceAll() {
                 const findStr = document.getElementById('findText').value;
                 const replStr = document.getElementById('replaceText').value;
                 const promptArea = document.getElementById('formPrompt');
                 
                 if (!findStr) return;
                 
-                const regex = new RegExp(escapeRegExp(findStr), 'g');
+                const regex = new RegExp(escapeRegExp(findStr), 'gi');
                 promptArea.value = promptArea.value.replace(regex, replStr);
                 
                 promptArea.classList.remove('flash-success');
                 void promptArea.offsetWidth;
                 promptArea.classList.add('flash-success');
+                
+                updateFindMatches();
             }
 
             // --- BULK MODE LOGIK ---
@@ -2581,7 +2644,6 @@ def get_html(request: Request):
                 renderMediaPreviews();
             }
 
-            // Init SortableJS for Drag-and-Drop Image Reordering
             function initSortableMedia() {
                 const el = document.getElementById('mediaPreviews');
                 if (sortableMediaInstance) sortableMediaInstance.destroy();
@@ -3131,7 +3193,6 @@ def get_html(request: Request):
 
                     let carouselHtml = `<div class="flex overflow-x-auto snap-x snap-mandatory hide-scrollbar h-full w-full" id="carousel-${p.id}" onscroll="updateCarouselCounter('${p.id}', ${images.length})">`;
                     images.forEach((img, idx) => {
-                    // Lazy load thumbnails in Gallery view with fallback to full size
                     carouselHtml += `<img src="/images/thumb_${img}" onerror="this.onerror=null; this.src='/images/${img}';" loading="lazy" class="snap-center min-w-full h-full w-full object-cover object-center bg-gray-900 cursor-pointer" title="${tooltipPrompt}">`;
                     });
                     carouselHtml += `</div>`;
@@ -3246,6 +3307,8 @@ def get_html(request: Request):
                 
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
+                document.getElementById('findReplaceContainer').classList.add('hidden');
+                updateFindMatches();
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
@@ -3272,13 +3335,14 @@ def get_html(request: Request):
                 
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
+                document.getElementById('findReplaceContainer').classList.add('hidden');
+                updateFindMatches();
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
                 
                 const imgs = parseImages(p.image_path);
                 mediaItems = imgs.map((img, idx) => ({
-                    // For editing, preview with thumbnail path where possible, or fallback
                     type: 'existing', val: img, url: '/images/thumb_' + img, isCover: idx === 0 
                 }));
                 renderMediaPreviews();
@@ -3379,6 +3443,8 @@ def get_html(request: Request):
                 
                 document.getElementById('findText').value = '';
                 document.getElementById('replaceText').value = '';
+                document.getElementById('findReplaceContainer').classList.add('hidden');
+                updateFindMatches();
                 
                 const savedLang = localStorage.getItem('nanobananaTagLanguage');
                 if(savedLang) document.getElementById('tagLanguage').value = savedLang;
